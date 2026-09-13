@@ -1,0 +1,11 @@
+# Local Python environment
+.venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Generated SQLite index and runtime files
+search-index/*.db
+search-index/*.db-shm
+search-index/*.db-wal

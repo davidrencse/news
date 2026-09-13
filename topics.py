@@ -1,0 +1,133 @@
+"""Default topic tree. Each subtopic maps to Medium tags used by Discover (medium.com/feed/tag/<tag>)."""
+
+DEFAULT_TREE = [
+    ("cybersecurity", "Cybersecurity", [
+        ("red-teaming", "Red Teaming", ["red-team", "red-teaming", "penetration-testing"]),
+        ("blue-teaming", "Blue Teaming", ["blue-team", "soc", "incident-response"]),
+        ("malware", "Malware", ["malware", "malware-analysis"]),
+        ("exploits", "Exploits", ["exploit", "exploit-development", "exploitation"]),
+        ("vulnerability-research", "Vulnerability Research", ["vulnerability-research", "vulnerability", "cve"]),
+        ("web-security", "Web Security", ["web-security", "bug-bounty", "xss-attack"]),
+        ("network-security", "Network Security", ["network-security", "firewall"]),
+        ("cloud-security", "Cloud Security", ["cloud-security", "aws-security"]),
+        ("reverse-engineering", "Reverse Engineering", ["reverse-engineering", "binary-exploitation"]),
+        ("digital-forensics", "Digital Forensics", ["digital-forensics", "forensics", "dfir"]),
+        ("threat-intelligence", "Threat Intelligence", ["threat-intelligence", "threat-hunting"]),
+        ("ctfs", "CTFs", ["ctf", "ctf-writeup", "tryhackme", "hackthebox"]),
+        ("tutorials", "Tutorials", ["ethical-hacking", "hacking", "infosec"]),
+        ("news", "News", ["cybersecurity-news", "cybersecurity", "data-breach"]),
+    ]),
+    ("artificial-intelligence", "Artificial Intelligence", [
+        ("agents", "Agents", ["ai-agent", "ai-agents", "agentic-ai"]),
+        ("llms", "LLMs", ["llm", "large-language-models"]),
+        ("claude", "Claude", ["claude", "anthropic", "claude-code"]),
+        ("codex", "Codex", ["codex", "openai-codex", "openai"]),
+        ("open-source-ai", "Open-Source AI", ["open-source-ai", "ollama", "hugging-face"]),
+        ("chinese-ai", "Chinese AI", ["deepseek", "qwen", "chinese-ai"]),
+        ("machine-learning", "Machine Learning", ["machine-learning"]),
+        ("deep-learning", "Deep Learning", ["deep-learning", "neural-networks"]),
+        ("computer-vision", "Computer Vision", ["computer-vision"]),
+        ("rag", "RAG", ["rag", "retrieval-augmented-generation", "vector-database"]),
+        ("inference", "Inference", ["llm-inference", "inference", "vllm"]),
+        ("training", "Training", ["fine-tuning", "model-training", "llm-fine-tuning"]),
+        ("ai-security", "AI Security", ["ai-security", "prompt-injection", "llm-security"]),
+        ("research", "Research", ["ai-research", "research-paper"]),
+        ("news", "News", ["ai-news", "artificial-intelligence"]),
+    ]),
+    ("computer-science", "Computer Science", [
+        ("algorithms", "Algorithms", ["algorithms"]),
+        ("data-structures", "Data Structures", ["data-structures"]),
+        ("operating-systems", "Operating Systems", ["operating-systems", "linux-kernel"]),
+        ("computer-architecture", "Computer Architecture", ["computer-architecture"]),
+        ("distributed-systems", "Distributed Systems", ["distributed-systems"]),
+        ("databases", "Databases", ["database", "databases", "postgresql"]),
+        ("networking", "Networking", ["networking", "computer-networking"]),
+        ("compilers", "Compilers", ["compilers", "llvm"]),
+        ("programming-languages", "Programming Languages", ["programming-languages", "rust", "golang"]),
+        ("theory", "Theory", ["computer-science", "theory-of-computation"]),
+    ]),
+    ("software-engineering", "Software Engineering", [
+        ("backend", "Backend", ["backend", "backend-development"]),
+        ("frontend", "Frontend", ["frontend", "frontend-development", "react"]),
+        ("full-stack", "Full-Stack", ["full-stack", "full-stack-development"]),
+        ("devops", "DevOps", ["devops"]),
+        ("cloud", "Cloud", ["cloud-computing", "aws"]),
+        ("linux", "Linux", ["linux"]),
+        ("containers", "Containers", ["docker", "containers"]),
+        ("kubernetes", "Kubernetes", ["kubernetes"]),
+        ("system-design", "System Design", ["system-design", "software-architecture"]),
+        ("performance", "Performance", ["performance", "performance-optimization"]),
+        ("developer-tools", "Developer Tools", ["developer-tools", "vscode", "git"]),
+    ]),
+    ("engineering", "Engineering", [
+        ("electrical-engineering", "Electrical Engineering", ["electrical-engineering"]),
+        ("electronics", "Electronics", ["electronics"]),
+        ("embedded-systems", "Embedded Systems", ["embedded-systems", "microcontrollers"]),
+        ("fpga", "FPGA", ["fpga", "verilog"]),
+        ("robotics", "Robotics", ["robotics"]),
+        ("semiconductors", "Semiconductors", ["semiconductors"]),
+        ("telecommunications", "Telecommunications", ["telecommunications", "5g"]),
+        ("mechanical-engineering", "Mechanical Engineering", ["mechanical-engineering"]),
+        ("aerospace", "Aerospace", ["aerospace", "aviation"]),
+    ]),
+    ("hardware", "Hardware", [
+        ("cpus", "CPUs", ["cpu", "processors"]),
+        ("gpus", "GPUs", ["gpu", "nvidia"]),
+        ("chips", "Chips", ["chips", "chip-design"]),
+        ("computer-hardware", "Computer Hardware", ["hardware", "computer-hardware"]),
+        ("datacenters", "Datacenters", ["data-center", "data-centers"]),
+        ("fabrication", "Fabrication", ["tsmc", "semiconductor-manufacturing"]),
+        ("hardware-news", "Hardware News", ["tech-news", "intel", "amd"]),
+    ]),
+    ("industry", "Industry", [
+        ("manufacturing", "Manufacturing", ["manufacturing"]),
+        ("supply-chains", "Supply Chains", ["supply-chain", "supply-chain-management"]),
+        ("semiconductors", "Semiconductors", ["semiconductor-industry", "semiconductors"]),
+        ("logistics", "Logistics", ["logistics"]),
+        ("energy", "Energy", ["energy", "renewable-energy"]),
+        ("industrial-policy", "Industrial Policy", ["industrial-policy", "chips-act"]),
+        ("defense-industry", "Defense Industry", ["defense-industry", "defense"]),
+    ]),
+    ("geopolitics", "Geopolitics", [
+        ("united-states", "United States", ["united-states", "us-politics"]),
+        ("china", "China", ["china"]),
+        ("europe", "Europe", ["europe", "european-union"]),
+        ("russia", "Russia", ["russia"]),
+        ("india", "India", ["india"]),
+        ("trade", "Trade", ["trade", "tariffs"]),
+        ("technology-policy", "Technology Policy", ["tech-policy", "technology-policy"]),
+        ("sanctions", "Sanctions", ["sanctions", "export-controls"]),
+        ("geopolitics-news", "Geopolitics News", ["geopolitics", "international-relations"]),
+    ]),
+    ("business", "Business", [
+        ("startups", "Startups", ["startup", "startups"]),
+        ("big-tech", "Big Tech", ["big-tech"]),
+        ("venture-capital", "Venture Capital", ["venture-capital"]),
+        ("economics", "Economics", ["economics"]),
+        ("markets", "Markets", ["stock-market", "investing"]),
+        ("strategy", "Strategy", ["business-strategy", "strategy"]),
+    ]),
+    ("science", "Science", [
+        ("physics", "Physics", ["physics"]),
+        ("mathematics", "Mathematics", ["mathematics", "math"]),
+        ("space", "Space", ["space", "astronomy"]),
+        ("materials-science", "Materials Science", ["materials-science"]),
+        ("energy", "Energy", ["nuclear-energy", "energy"]),
+        ("research", "Research", ["science", "research"]),
+    ]),
+    ("custom", "Custom", []),
+]
+
+
+def default_topics():
+    return [
+        {
+            "id": tid,
+            "name": tname,
+            "subtopics": [
+                {"id": sid, "name": sname, "tags": list(tags), "custom": False}
+                for sid, sname, tags in subs
+            ],
+        }
+        for tid, tname, subs in DEFAULT_TREE
+    ]
