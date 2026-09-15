@@ -9,3 +9,6 @@ __pycache__/
 search-index/*.db
 search-index/*.db-shm
 search-index/*.db-wal
+
+# Atomic-write scratch files
+*.tmp

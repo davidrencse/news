@@ -10,6 +10,10 @@ Each cycle takes the subtopic that was curated longest ago:
    share, a clearly better post replaces the weakest auto-added article you never downloaded.
    Articles you added yourself or downloaded are never removed.
 
+Filling a topic to its target is a long background job: every post page goes through polite.py's
+limiter, so the curator reads about one page a second no matter how many it wants. The target is a
+ceiling it walks towards over days of uptime, not something the app fetches up front.
+
 While subtopics are below their share the curator cycles quickly (the limiter still spaces requests);
 after that it slows to one subtopic every CYCLE_SECONDS. A second thread records whether each library
 article is member-only (paywalled) or free.
@@ -28,11 +32,13 @@ import medium_render
 import polite
 
 CAP = 12               # minimum auto-added articles kept per subtopic
-TOPIC_TARGET = 120     # each topic aims for at least this many; its subtopics share the target
+TOPIC_TARGET = 1120    # each topic aims for at least this many; its subtopics share the target
 PAGES_PER_CYCLE = 5    # post pages read per cycle
 ADDS_PER_CYCLE = 3     # keeps churn gentle once a subtopic is full
 CYCLE_SECONDS = 120
 FAST_CYCLE_SECONDS = 3
+POOL_SIZE = 100        # candidate URLs considered per cycle
+SCAN_LIMIT = 4000      # index rows looked at per priority tier; a full subtopic has excluded most of them
 RECENT_DAYS = 14
 MIN_INDEX_DAYS = 7
 
@@ -123,15 +129,21 @@ def post_meta(url):
     return medium_render.meta_of(state, post) if post else None
 
 
-def candidates(db, phrases, exclude, limit, since=None):
+def candidates(db, phrases, exclude, limit, since=None, scan=SCAN_LIMIT):
+    """`limit` indexed post URLs matching any of `phrases` and not already in `exclude`.
+
+    `scan` is how far down the ranking to look. It has to grow with the library: a subtopic holding a
+    thousand articles has already taken most of the best-rated rows, so a fixed window would come back
+    empty and the subtopic would look exhausted while plenty of candidates remain below it.
+    """
     match = " OR ".join('"%s"' % p.replace('"', "") for p in phrases)
     day_filter = "AND posts.day >= ?" if since else ""
     out = []
     for min_prio in (0.7, 0.5, 0.0):  # widen only when the best-rated posts run out
-        params = [match, min_prio] + ([since] if since else [])
+        params = [match, min_prio] + ([since] if since else []) + [scan]
         rows = db.execute("SELECT posts.url FROM posts_fts JOIN posts ON posts.id = posts_fts.rowid "
                           f"WHERE posts_fts MATCH ? AND posts.prio >= ? {day_filter} "
-                          "ORDER BY posts.prio DESC, posts_fts.rank LIMIT 200", params).fetchall()
+                          "ORDER BY posts.prio DESC, posts_fts.rank LIMIT ?", params).fetchall()
         for (url,) in rows:
             words = url.rsplit("/", 1)[-1].replace("-", " ")
             if url in exclude or url in out or re.search(r"[^\x00-\x7f]", url) or not ENGLISH.search(words):
@@ -275,13 +287,14 @@ class Curator:
         Uses cached page data when it already says, otherwise reads the post page through the shared
         limiter. Pages Medium refuses are marked unknown and retried the next day."""
         time.sleep(20)
-        changed = 0
+        changed, todo = 0, []
         while not self._stopping:
             today = date.today().isoformat()
-            with self.store.lock:
-                todo = [a for a in self.store.data["articles"]
-                        if "locked" not in a or (a["locked"] is None and a.get("locked_checked") != today)]
-            self.backfill_left = len(todo)
+            if not todo:  # rescanning a library of tens of thousands per article would dominate this loop
+                with self.store.lock:
+                    todo = [a for a in self.store.data["articles"]
+                            if "locked" not in a or (a["locked"] is None and a.get("locked_checked") != today)]
+                self.backfill_left = len(todo)
             if not todo:
                 if changed:
                     self.store.save()
@@ -293,14 +306,16 @@ class Curator:
             if wait > 30:  # Medium asked us to back off
                 time.sleep(wait)
                 continue
-            a = todo[0]
+            a = todo[-1]  # oldest first; the list is newest-first
             meta = self.cache.get(a["url"])
             if not (meta and "locked" in meta):
                 try:
                     meta = post_meta(a["url"])
                 except urllib.error.HTTPError as e:
                     if e.code in (429, 503):
-                        continue  # the limiter has slowed down; try again later
+                        # the limiter has slowed down; wait out its pause rather than spinning on this one
+                        time.sleep(max(5, polite.status().get("medium.com", {}).get("waiting_s", 0)))
+                        continue
                     meta = None
                 except Exception:
                     meta = None
@@ -311,6 +326,8 @@ class Curator:
                 a["locked_checked"] = today
                 if meta and a.get("claps") is not None:
                     a["claps"] = max(a["claps"], meta["claps"])
+            todo.pop()
+            self.backfill_left = len(todo)
             changed += 1
             if changed >= 20:
                 self.store.save()
@@ -362,15 +379,21 @@ class Curator:
         key, phrases = f"{tid}/{sub['id']}", phrases_for(tid, sub)
         with self.store.lock:
             have = {a["url"] for a in self.store.data["articles"]}
+            auto = [a for a in self.store.data["articles"]
+                    if a["topic"] == tid and a["subtopic"] == sub["id"] and a.get("source") == "auto"]
         since = (date.today() - timedelta(days=RECENT_DAYS)).isoformat()
+        # look further down the ranking the more this subtopic already holds; see candidates()
+        scan = SCAN_LIMIT + 8 * len(auto)
         db = sqlite3.connect(f"file:{self.index.path}?mode=ro", uri=True)
         try:
-            pool = candidates(db, phrases, have, 40, since) + candidates(db, phrases, have, 60)
+            recent = POOL_SIZE * 2 // 5
+            pool = (candidates(db, phrases, have, recent, since, scan)
+                    + candidates(db, phrases, have, POOL_SIZE - recent, None, scan))
         finally:
             db.close()
         pool = list(dict.fromkeys(pool))
 
-        unread = [u for u in pool if u not in self.cache][:PAGES_PER_CYCLE * (2 if filling else 1)]
+        unread = [u for u in pool if u not in self.cache][:PAGES_PER_CYCLE * (4 if filling else 1)]
         for url in unread:
             try:
                 self.cache.set(url, post_meta(url))
@@ -387,28 +410,40 @@ class Curator:
                 and not m["response"] and fits(m, tid, sub, phrases)]
         good.sort(key=lambda x: trend_score(x[1]["claps"], x[1]["published"]), reverse=True)
 
+        def take(url, fields):
+            """Add one post to the subtopic. add_article normalizes the URL, so what comes back can
+            turn out to be an article we already hold; only a genuinely new one counts."""
+            a = self.add_article(fields)
+            have.update((url, a["url"]))
+            if any(x is a for x in auto):
+                return False
+            auto.append(a)
+            return True
+
+        def drop(a):
+            for i, x in enumerate(auto):  # by identity: two articles can compare equal by value
+                if x is a:
+                    del auto[i]
+                    break
+            self.remove_article(a)
+
         added = rotated = 0
         for url, m in good:
             if not filling and added + rotated >= ADDS_PER_CYCLE:
                 break
-            with self.store.lock:
-                if any(a["url"] == url for a in self.store.data["articles"]):
-                    continue
-                auto = [a for a in self.store.data["articles"]
-                        if a["topic"] == tid and a["subtopic"] == sub["id"] and a.get("source") == "auto"]
+            if url in have:
+                continue
             fields = {"url": url, "topic": tid, "subtopic": sub["id"], "title": m["title"], "author": m["author"],
                       "snippet": m["snippet"], "image": m["image"], "published": m["published"],
                       "claps": m["claps"], "source": "auto", "locked": m.get("locked")}
             if len(auto) < cap:
-                self.add_article(fields)
-                added += 1
+                added += take(url, fields)
                 continue
             replaceable = [a for a in auto if not a.get("pdf")]
             weakest = min(replaceable, key=lambda a: trend_score(a.get("claps"), a.get("published")), default=None)
             if weakest and trend_score(m["claps"], m["published"]) > 1.2 * trend_score(weakest.get("claps"), weakest.get("published")):
-                self.remove_article(weakest)
-                self.add_article(fields)
-                rotated += 1
+                drop(weakest)
+                rotated += take(url, fields)
             else:
                 break  # everything after this ranks lower still
 

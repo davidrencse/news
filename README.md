@@ -56,6 +56,13 @@ Highlights and notes are saved in `notes/<article id>.json`, so they survive re-
 | `topics.py` | Default topic tree and Medium tags for each subtopic |
 | `static/` | The UI (plain HTML, CSS, and JS) |
 | `Medium-Library/` | Your PDFs, plus `library.json` (the index of topics and articles) |
+| `selftest.py` | Offline self-test of the library API, search index, renderer and curator |
+
+## Checking the app still works
+
+`python selftest.py` runs the whole app against stubbed Medium pages: the library API, the search
+index, the article renderer and the curator. It never touches the network and never writes to your
+library — it works in a temporary folder and prints a line per check.
 
 ## Settings
 
@@ -81,9 +88,10 @@ While the server runs, `curator.py` keeps each subtopic stocked with trending Me
 
 - It visits one subtopic at a time. It finds candidates in the local index, reads a few post pages it hasn't seen before, and keeps posts whose Medium tags fit the subtopic.
 - Posts are ranked by claps weighted by age, so fresh popular posts can outrank older ones.
-- The curator adds up to 12 articles per subtopic. After that, a clearly better post replaces the weakest article the curator added that you haven't downloaded. It never removes articles you added yourself or articles you downloaded.
+- The curator adds up to its subtopic's share of the topic target. After that, a clearly better post replaces the weakest article the curator added that you haven't downloaded. It never removes articles you added yourself or articles you downloaded.
 - Subtopics with fewer than 8 articles are filled quickly first. After that, the curator visits one subtopic every 2 minutes.
-- Each topic aims for at least 120 articles. Its subtopics share that target, with at least 12 each. When a subtopic runs out of candidates, the other subtopics in that topic make up the difference.
+- Each topic aims for at least 1,120 articles. Its subtopics share that target, with at least 12 each. When a subtopic runs out of candidates, the other subtopics in that topic make up the difference.
+- That target is a ceiling the curator walks towards, not a download. Every post page it reads goes through the shared rate limiter at about one request a second, so a fresh library fills over days of uptime, and only articles you actually open are turned into PDFs.
 - Every article shows whether it is **🔒 Member-only** (paywalled) or **Free**. The status comes from the story's Medium page. A background check fills it in for older articles and refreshes their clap counts. Use the **All / Free / Member-only** filters above any list to show just one kind.
 - Articles added in the last 24 hours show a **New** badge, and the page refreshes itself when the library changes.
 - To turn this off, click the index panel in the sidebar and clear **Keep adding trending articles automatically**.

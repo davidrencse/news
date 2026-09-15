@@ -484,7 +484,7 @@ async function indexSettings() {
         ${(st.curator?.member_only || 0).toLocaleString()} member-only${st.curator?.backfill_left ? ` · ${st.curator.backfill_left.toLocaleString()} still being checked` : ''}.</p>
       <label class="check"><input type="checkbox" name="curator" ${st.curator?.enabled ? 'checked' : ''}> Keep adding trending articles automatically</label>
       <p class="hint">The curator visits one subtopic at a time, reads a few new posts, and adds the ones trending by claps.
-        Each topic aims for at least 120; once a subtopic has its share, better posts replace the weakest ones you haven't downloaded. It has added
+        Each topic aims for at least 1,120; once a subtopic has its share, better posts replace the weakest ones you haven't downloaded. It has added
         ${(st.curator?.added_total || 0).toLocaleString()} and swapped ${(st.curator?.rotated_total || 0).toLocaleString()} so far.
         ${(st.network?.['medium.com']?.pushbacks || 0) ? `Medium has pushed back ${st.network['medium.com'].pushbacks} times this session; requests are spaced ${st.network['medium.com'].gap_s}s apart.` : ''}</p>
       ${st.error ? `<div class="warn">${esc(st.error)}</div>` : ''}
