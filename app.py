@@ -7,6 +7,7 @@ import hashlib
 import html
 import json
 import os
+import posixpath
 import re
 import shutil
 import threading
@@ -19,7 +20,7 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -50,7 +51,7 @@ def choose_data_dir():
         return ROOT
     target = os.path.join(FALLBACK_STORAGE, "medium-library")
     os.makedirs(target, exist_ok=True)
-    for name in ("Medium-Library", "search-index"):
+    for name in ("Medium-Library", "search-index", "notes"):
         src, dst = os.path.join(ROOT, name), os.path.join(target, name)
         if os.path.exists(src) and not os.path.exists(dst):
             shutil.move(src, dst)
@@ -64,6 +65,7 @@ DATA_DIR = choose_data_dir()
 LIBRARY_DIR = os.path.join(DATA_DIR, "Medium-Library")
 DB_PATH = os.path.join(LIBRARY_DIR, "library.json")
 STATIC_DIR = os.path.join(ROOT, "static")
+NOTES_DIR = os.path.join(DATA_DIR, "notes")  # highlights + notes per article, kept apart from downloads
 FEED_TTL = 15 * 60
 
 
@@ -105,7 +107,7 @@ class Store:
 
 
 store = Store(DB_PATH)
-pipeline = PdfPipeline()
+pipeline = PdfPipeline(STATIC_DIR)
 jobs: dict[str, dict] = {}
 feed_cache: dict[str, tuple[float, list]] = {}
 
@@ -138,7 +140,17 @@ def guess_title(url):
 
 
 def pdf_rel_path(a):
+    """Where PDFs lived before articles got their own folder (still used for older downloads)."""
     return f"{a['topic']}/{a['subtopic']}/{slugify(a['title'])}-{a['id'][:8]}.pdf"
+
+
+def folder_rel(a):
+    """An article's folder: content.html (reader), images/, article.pdf (single page)."""
+    return f"{a['topic']}/{a['subtopic']}/{slugify(a['title'])}-{a['id'][:8]}"
+
+
+def notes_path(aid):
+    return os.path.join(NOTES_DIR, re.sub(r"[^0-9a-f]", "", aid) + ".json")
 
 
 def abs_path(rel):
@@ -152,6 +164,7 @@ def now_iso():
 def public(a):
     out = dict(a)
     out["pdf_url"] = f"/files/{a['pdf']}" if a.get("pdf") and os.path.exists(abs_path(a["pdf"])) else None
+    out["doc_url"] = f"/files/{a['doc']}" if a.get("doc") and os.path.exists(abs_path(a["doc"])) else None
     return out
 
 
@@ -164,7 +177,7 @@ def fetch_tag_feed(tag):
     hit = feed_cache.get(tag)
     if hit and time.time() - hit[0] < FEED_TTL:
         return hit[1]
-    root = ET.fromstring(polite.get(f"https://medium.com/feed/tag/{tag}", timeout=20))
+    root = ET.fromstring(polite.get(f"https://medium.com/feed/tag/{tag}", timeout=20, priority=True))
     items = []
     for it in root.iter("item"):
         link = it.findtext("link") or ""
@@ -432,6 +445,8 @@ def create_article(fields):
         }
         if fields.get("source"):
             a["source"] = fields["source"]
+        if fields.get("locked") is not None:
+            a["locked"] = bool(fields["locked"])  # True = member-only (paywalled)
         store.data["articles"].insert(0, a)
         store.save()
     return a
@@ -442,8 +457,12 @@ def remove_article(a):
         if a in store.data["articles"]:
             store.data["articles"].remove(a)
             store.save()
-    if a.get("pdf") and os.path.exists(abs_path(a["pdf"])):
+    if a.get("doc"):
+        shutil.rmtree(abs_path(posixpath.dirname(a["doc"])), ignore_errors=True)
+    elif a.get("pdf") and os.path.exists(abs_path(a["pdf"])):
         os.remove(abs_path(a["pdf"]))
+    if os.path.exists(notes_path(a["id"])):
+        os.remove(notes_path(a["id"]))
 
 
 @app.post("/api/articles")
@@ -461,12 +480,18 @@ def move_article(aid: str, body: MoveIn):
     if not store.subtopic(body.topic, body.subtopic):
         raise HTTPException(404, "Subtopic not found.")
     with store.lock:
-        old = a.get("pdf")
+        old_pdf, old_doc = a.get("pdf"), a.get("doc")
         a["topic"], a["subtopic"] = body.topic, body.subtopic
-        if old and os.path.exists(abs_path(old)):
+        if old_doc:
+            old_dir, new_rel = abs_path(posixpath.dirname(old_doc)), folder_rel(a)
+            if os.path.isdir(old_dir) and old_dir != abs_path(new_rel):
+                os.makedirs(os.path.dirname(abs_path(new_rel)), exist_ok=True)
+                shutil.move(old_dir, abs_path(new_rel))
+            a["doc"], a["pdf"] = f"{new_rel}/content.html", f"{new_rel}/article.pdf"
+        elif old_pdf and os.path.exists(abs_path(old_pdf)):
             new = pdf_rel_path(a)
             os.makedirs(os.path.dirname(abs_path(new)), exist_ok=True)
-            shutil.move(abs_path(old), abs_path(new))
+            shutil.move(abs_path(old_pdf), abs_path(new))
             a["pdf"] = new
         store.save()
     return public(a)
@@ -482,31 +507,43 @@ def delete_article(aid: str):
 
 
 async def run_job(job, a):
-    def stage(s):
+    def stage(s, **info):
         job["stage"] = s
+        job.update(info)  # route ("medium" | "freedium"), reason, freedium_url
+        job.setdefault("timings", {})[s] = round(time.time() - job["started"], 1)  # seconds since start
 
+    # render into a scratch folder, then swap it in under the article's real title
+    incoming = abs_path(f"{a['topic']}/{a['subtopic']}/.incoming-{a['id'][:8]}")
     try:
-        rel = pdf_rel_path(a)
-        meta = await pipeline.render(a["url"], abs_path(rel), stage)
+        shutil.rmtree(incoming, ignore_errors=True)
+        meta = await pipeline.render(a["url"], incoming, stage)
         with store.lock:
-            if meta.get("title") and a["title"] != meta["title"]:
-                # rename file to match the real title now that we know it
+            if meta.get("title"):
                 a["title"] = meta["title"]
-                better = pdf_rel_path(a)
-                if better != rel:
-                    shutil.move(abs_path(rel), abs_path(better))
-                    rel = better
-            if a.get("pdf") and a["pdf"] != rel and os.path.exists(abs_path(a["pdf"])):
-                os.remove(abs_path(a["pdf"]))
+            rel = folder_rel(a)
+            if a.get("doc"):
+                shutil.rmtree(abs_path(posixpath.dirname(a["doc"])), ignore_errors=True)
+            elif a.get("pdf") and os.path.isfile(abs_path(a["pdf"])):
+                os.remove(abs_path(a["pdf"]))  # a download from before articles had folders
+            shutil.rmtree(abs_path(rel), ignore_errors=True)
+            os.replace(incoming, abs_path(rel))
             a["author"] = meta.get("author") or a["author"]
             a["snippet"] = a["snippet"] or meta.get("subtitle", "")
-            a["pdf"], a["fetched"] = rel, now_iso()
+            a["doc"], a["pdf"], a["fetched"] = f"{rel}/content.html", f"{rel}/article.pdf", now_iso()
+            a["via"], a["via_reason"] = meta.get("route"), meta.get("reason")
+            if meta.get("route") == "medium":
+                a["locked"] = False
+            elif meta.get("reason") in ("member-only story", "paywalled (HTTP 402)"):
+                a["locked"] = True
             store.save()
+        job.setdefault("timings", {})["done"] = round(time.time() - job["started"], 1)
         job.update(status="done", stage="done", article=public(a))
     except PipelineError as e:
         job.update(status="error", error=str(e))
     except Exception as e:
         job.update(status="error", error=f"{type(e).__name__}: {e}")
+    finally:
+        shutil.rmtree(incoming, ignore_errors=True)
 
 
 @app.post("/api/articles/{aid}/fetch")
@@ -519,11 +556,48 @@ async def fetch_article(aid: str, force: bool = False):
     running = next((j for j in jobs.values() if j["article_id"] == aid and j["status"] == "running"), None)
     if running:
         return running
-    job = {"id": uuid.uuid4().hex[:10], "article_id": aid, "status": "running", "stage": "queued",
-           "freedium_url": pipeline.freedium_url(a["url"])}
+    job = {"id": uuid.uuid4().hex[:10], "article_id": aid, "status": "running", "stage": "queued", "started": time.time()}
     jobs[job["id"]] = job
     asyncio.create_task(run_job(job, a))
     return job
+
+
+class NotesIn(BaseModel):
+    notes: str = ""
+    highlights: list[dict] = []
+
+
+@app.get("/api/articles/{aid}/notes")
+def get_notes(aid: str):
+    if not store.article(aid):
+        raise HTTPException(404, "Article not found.")
+    path = notes_path(aid)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return {"notes": "", "highlights": []}
+
+
+@app.put("/api/articles/{aid}/notes")
+def put_notes(aid: str, body: NotesIn):
+    a = store.article(aid)
+    if not a:
+        raise HTTPException(404, "Article not found.")
+    data = body.model_dump()
+    raw = json.dumps(data, ensure_ascii=False, indent=1)
+    if len(raw) > 2_000_000:
+        raise HTTPException(413, "Notes are too large to save.")
+    os.makedirs(NOTES_DIR, exist_ok=True)
+    tmp = notes_path(aid) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(raw)
+    os.replace(tmp, notes_path(aid))
+    count = len(data["highlights"]) + (1 if data["notes"].strip() else 0)
+    with store.lock:
+        if a.get("notes_count", 0) != count:
+            a["notes_count"] = count
+            store.save()
+    return {"ok": True, "notes_count": count}
 
 
 @app.get("/api/jobs/{jid}")
@@ -542,7 +616,18 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    """index.html with each local asset URL stamped by its modification time, so the browser never
+    keeps running an old app.js/style.css after an update."""
+    with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as f:
+        page = f.read()
+
+    def stamp(m):
+        path = os.path.join(STATIC_DIR, *m.group(2).split("/"))
+        version = int(os.path.getmtime(path)) if os.path.exists(path) else 0
+        return f'{m.group(1)}/static/{m.group(2)}?v={version}"'
+
+    page = re.sub(r'((?:src|href)=")/static/([^"?]+)"', stamp, page)
+    return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":

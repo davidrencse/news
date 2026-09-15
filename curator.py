@@ -6,13 +6,16 @@ Each cycle takes the subtopic that was curated longest ago:
 2. A few post pages it hasn't seen are read through polite.py (shared, self-throttling limiter),
    for the real title, author, claps, language and tags. Results are cached, so no page is read twice.
 3. Posts that fit the subtopic are ranked by trend: claps weighted down by age.
-4. Up to CAP auto-added articles per subtopic. Past that, a clearly better post replaces the weakest
-   auto-added article you never downloaded. Articles you added yourself or downloaded are never removed.
+4. Each topic aims for TOPIC_TARGET articles, shared by its subtopics (at least CAP each). Past its
+   share, a clearly better post replaces the weakest auto-added article you never downloaded.
+   Articles you added yourself or downloaded are never removed.
 
-While subtopics are below FILL_TARGET the curator cycles quickly (the limiter still spaces requests);
-after that it slows to one subtopic every CYCLE_SECONDS.
+While subtopics are below their share the curator cycles quickly (the limiter still spaces requests);
+after that it slows to one subtopic every CYCLE_SECONDS. A second thread records whether each library
+article is member-only (paywalled) or free.
 """
 import json
+import math
 import os
 import re
 import sqlite3
@@ -21,10 +24,11 @@ import time
 import urllib.error
 from datetime import date, datetime, timedelta, timezone
 
+import medium_render
 import polite
 
-CAP = 12               # auto-added articles kept per subtopic
-FILL_TARGET = 8        # below this, cycle quickly
+CAP = 12               # minimum auto-added articles kept per subtopic
+TOPIC_TARGET = 120     # each topic aims for at least this many; its subtopics share the target
 PAGES_PER_CYCLE = 5    # post pages read per cycle
 ADDS_PER_CYCLE = 3     # keeps churn gentle once a subtopic is full
 CYCLE_SECONDS = 120
@@ -115,38 +119,8 @@ def post_meta(url):
         if e.code in (404, 410):
             return None
         raise
-    i = page.find("window.__APOLLO_STATE__")
-    if i < 0:
-        return None
-    try:
-        state, _ = json.JSONDecoder().raw_decode(page[page.find("{", i):])
-    except ValueError:
-        return None
-    pid = url.rstrip("/").rsplit("/", 1)[-1].rsplit("-", 1)[-1]
-    post = state.get(f"Post:{pid}")
-    if not post:
-        posts = [v for k, v in state.items() if k.startswith("Post:") and "clapCount" in v]
-        post = posts[0] if len(posts) == 1 else None
-    if not post:
-        return None
-    creator = state.get((post.get("creator") or {}).get("__ref", ""), {})
-    tags = []
-    for t in post.get("tags") or []:
-        ref = t.get("__ref", "") if isinstance(t, dict) else ""
-        tags.append(state.get(ref, {}).get("id") or ref.split(":", 1)[-1])
-    image = (post.get("previewImage") or {}).get("id")
-    ts = post.get("firstPublishedAt")
-    return {
-        "title": (post.get("title") or "").strip(),
-        "claps": int(post.get("clapCount") or 0),
-        "author": creator.get("name") or "",
-        "published": datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat(timespec="seconds") if ts else None,
-        "lang": post.get("detectedLanguage"),
-        "response": bool(post.get("inResponseToPostResult")),
-        "tags": [t for t in tags if t],
-        "snippet": ((post.get("extendedPreviewContent") or {}).get("subtitle") or "").strip(),
-        "image": f"https://miro.medium.com/v2/resize:fill:320:214/{image}" if image else None,
-    }
+    state, post = medium_render.parse_post(page, url)
+    return medium_render.meta_of(state, post) if post else None
 
 
 def candidates(db, phrases, exclude, limit, since=None):
@@ -212,6 +186,7 @@ class Curator:
         self.current = None
         self.error = None
         self.next_at = None
+        self.backfill_left = None
         self._wake = threading.Event()
         self._stopping = False
 
@@ -239,17 +214,22 @@ class Curator:
     def status(self):
         st = self._state()
         with self.store.lock:
-            auto = sum(1 for a in self.store.data["articles"] if a.get("source") == "auto")
+            articles = self.store.data["articles"]
+            auto = sum(1 for a in articles if a.get("source") == "auto")
+            member_only = sum(1 for a in articles if a.get("locked") is True)
+            free = sum(1 for a in articles if a.get("locked") is False)
         last_key = max(st["last"], key=st["last"].get) if st["last"] else None
         return {"enabled": st["enabled"], "current": self.current, "last": last_key,
                 "last_at": st["last"].get(last_key) if last_key else None,
                 "added_total": st["added"], "rotated_total": st["rotated"], "auto_articles": auto,
+                "member_only": member_only, "free": free, "backfill_left": self.backfill_left,
                 "pages_cached": len(self.cache), "error": self.error,
                 "next_in_s": max(0, round(self.next_at - time.time())) if self.next_at else None}
 
     # ------------------------------------------------------------ loop
     def start(self):
         threading.Thread(target=self._run, daemon=True, name="curator").start()
+        threading.Thread(target=self._backfill, daemon=True, name="paywall-check").start()
 
     def stop(self):
         self._stopping = True
@@ -278,10 +258,10 @@ class Curator:
             if not pick:
                 self._sleep(CYCLE_SECONDS)
                 continue
-            tid, sub, filling = pick
+            tid, sub, filling, cap = pick
             self.current = f"{tid}/{sub['id']}"
             try:
-                self.curate(tid, sub)
+                self.curate(tid, sub, cap, filling)
                 self.error = None
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
@@ -289,7 +269,59 @@ class Curator:
                 self.current = None
             self._sleep(FAST_CYCLE_SECONDS if filling else CYCLE_SECONDS)
 
+    def _backfill(self):
+        """Record paywall status (and fresh claps) for library articles that don't have it yet.
+
+        Uses cached page data when it already says, otherwise reads the post page through the shared
+        limiter. Pages Medium refuses are marked unknown and retried the next day."""
+        time.sleep(20)
+        changed = 0
+        while not self._stopping:
+            today = date.today().isoformat()
+            with self.store.lock:
+                todo = [a for a in self.store.data["articles"]
+                        if "locked" not in a or (a["locked"] is None and a.get("locked_checked") != today)]
+            self.backfill_left = len(todo)
+            if not todo:
+                if changed:
+                    self.store.save()
+                    self.cache.save()
+                    changed = 0
+                time.sleep(300)
+                continue
+            wait = polite.status().get("medium.com", {}).get("waiting_s", 0)
+            if wait > 30:  # Medium asked us to back off
+                time.sleep(wait)
+                continue
+            a = todo[0]
+            meta = self.cache.get(a["url"])
+            if not (meta and "locked" in meta):
+                try:
+                    meta = post_meta(a["url"])
+                except urllib.error.HTTPError as e:
+                    if e.code in (429, 503):
+                        continue  # the limiter has slowed down; try again later
+                    meta = None
+                except Exception:
+                    meta = None
+                if meta:
+                    self.cache.set(a["url"], meta)
+            with self.store.lock:
+                a["locked"] = meta["locked"] if meta else None
+                a["locked_checked"] = today
+                if meta and a.get("claps") is not None:
+                    a["claps"] = max(a["claps"], meta["claps"])
+            changed += 1
+            if changed >= 20:
+                self.store.save()
+                self.cache.save()
+                changed = 0
+
     def _next_subtopic(self):
+        """(tid, sub, filling, cap) for the subtopic to visit next.
+
+        Each topic aims for TOPIC_TARGET articles. Subtopics that ran out of candidates today keep what
+        they have; the other subtopics in that topic share the rest (never less than CAP each)."""
         st = self._state()
         today = date.today().isoformat()
         with self.store.lock:
@@ -302,16 +334,31 @@ class Curator:
                     counts[k] = counts.get(k, 0) + 1
         if not subs:
             return None
-        # subtopics still filling (and not exhausted today) come first, then round-robin by last visit
+        exhausted = lambda k: st["exhausted"].get(k) == today
+        caps = {}
+        for tid in {t for t, _ in subs}:
+            keys = [f"{tid}/{s['id']}" for t, s in subs if t == tid]
+            settled = sum(counts.get(k, 0) for k in keys if exhausted(k))
+            active = [k for k in keys if not exhausted(k)] or keys
+            share = math.ceil(max(0, TOPIC_TARGET - settled) / len(active))
+            for k in keys:
+                caps[k] = max(CAP, share)
+
+        topic_totals = {}
+        for k, n in counts.items():
+            topic_totals[k.split("/")[0]] = topic_totals.get(k.split("/")[0], 0) + n
+
+        # subtopics still filling come first, from the topic furthest below its target; then round-robin
         def order(item):
             k = f"{item[0]}/{item[1]['id']}"
-            filling = counts.get(k, 0) < FILL_TARGET and st["exhausted"].get(k) != today
-            return (0 if filling else 1, st["last"].get(k, ""))
+            if counts.get(k, 0) < caps[k] and not exhausted(k):
+                return (0, topic_totals.get(item[0], 0), st["last"].get(k, ""))
+            return (1, 0, st["last"].get(k, ""))
         tid, sub = min(subs, key=order)
         k = f"{tid}/{sub['id']}"
-        return tid, sub, counts.get(k, 0) < FILL_TARGET and st["exhausted"].get(k) != today
+        return tid, sub, counts.get(k, 0) < caps[k] and not exhausted(k), caps[k]
 
-    def curate(self, tid, sub):
+    def curate(self, tid, sub, cap=CAP, filling=False):
         key, phrases = f"{tid}/{sub['id']}", phrases_for(tid, sub)
         with self.store.lock:
             have = {a["url"] for a in self.store.data["articles"]}
@@ -323,7 +370,7 @@ class Curator:
             db.close()
         pool = list(dict.fromkeys(pool))
 
-        unread = [u for u in pool if u not in self.cache][:PAGES_PER_CYCLE]
+        unread = [u for u in pool if u not in self.cache][:PAGES_PER_CYCLE * (2 if filling else 1)]
         for url in unread:
             try:
                 self.cache.set(url, post_meta(url))
@@ -342,7 +389,7 @@ class Curator:
 
         added = rotated = 0
         for url, m in good:
-            if added + rotated >= ADDS_PER_CYCLE:
+            if not filling and added + rotated >= ADDS_PER_CYCLE:
                 break
             with self.store.lock:
                 if any(a["url"] == url for a in self.store.data["articles"]):
@@ -351,8 +398,8 @@ class Curator:
                         if a["topic"] == tid and a["subtopic"] == sub["id"] and a.get("source") == "auto"]
             fields = {"url": url, "topic": tid, "subtopic": sub["id"], "title": m["title"], "author": m["author"],
                       "snippet": m["snippet"], "image": m["image"], "published": m["published"],
-                      "claps": m["claps"], "source": "auto"}
-            if len(auto) < CAP:
+                      "claps": m["claps"], "source": "auto", "locked": m.get("locked")}
+            if len(auto) < cap:
                 self.add_article(fields)
                 added += 1
                 continue

@@ -1,0 +1,79 @@
+/* Article typography, shared by the in-app reader and the single-page PDF. */
+.doc {
+  --doc-ink: #1f1d1a;
+  --doc-muted: #6b665e;
+  --doc-faint: #9c958b;
+  --doc-line: #e6e1d8;
+  --doc-code-bg: #f5f3ef;
+  --tok-keyword: #a626a4;
+  --tok-string: #50a14f;
+  --tok-number: #986801;
+  --tok-comment: #a0a1a7;
+  --tok-title: #4078f2;
+  --tok-type: #c18401;
+  --tok-attr: #e45649;
+  --tok-meta: #0184bc;
+  color: var(--doc-ink);
+  font: 17px/1.72 Charter, "Bitstream Charter", "Sitka Text", Georgia, Cambria, serif;
+  max-width: 740px;
+  margin: 0 auto;
+  overflow-wrap: break-word;
+}
+.doc .source { font: 11.5px/1.4 "Segoe UI", system-ui, sans-serif; color: var(--doc-faint); margin-bottom: 20px; word-break: break-all; }
+.doc .source a { color: inherit; }
+.doc header { border-bottom: 1px solid var(--doc-line); padding-bottom: 20px; margin-bottom: 28px; }
+.doc h1 { font: 700 36px/1.16 "Segoe UI", system-ui, sans-serif; letter-spacing: -.02em; margin: 0 0 12px; }
+.doc .subtitle { font-size: 20px; line-height: 1.5; color: var(--doc-muted); margin: 0 0 14px; }
+.doc .byline { font: 13px/1.4 "Segoe UI", system-ui, sans-serif; color: var(--doc-muted); }
+.doc .byline b { color: var(--doc-ink); }
+.doc h2 { font: 700 24px/1.3 "Segoe UI", system-ui, sans-serif; margin: 38px 0 10px; letter-spacing: -.01em; }
+.doc h3 { font: 600 19px/1.35 "Segoe UI", system-ui, sans-serif; margin: 28px 0 8px; }
+.doc p { margin: 0 0 20px; }
+.doc a { color: inherit; text-decoration-color: var(--doc-faint); text-underline-offset: 2px; }
+.doc figure { margin: 30px 0; text-align: center; }
+.doc img { max-width: 100%; height: auto; border-radius: 2px; }
+.doc figcaption { font: 13px/1.45 "Segoe UI", system-ui, sans-serif; color: var(--doc-muted); margin-top: 8px; }
+.doc blockquote { margin: 24px 0; padding-left: 20px; border-left: 3px solid var(--doc-ink); font-style: italic; }
+.doc blockquote.pull { border: 0; padding: 0 24px; font-size: 23px; line-height: 1.45; color: var(--doc-muted); text-align: center; }
+.doc ul, .doc ol { margin: 0 0 20px; padding-left: 28px; }
+.doc li { margin-bottom: 8px; }
+.doc hr, .doc hr.section { border: 0; text-align: center; margin: 34px 0; }
+.doc hr::after { content: "\2022  \2022  \2022"; color: var(--doc-faint); letter-spacing: 8px; }
+.doc .card { border: 1px solid var(--doc-line); border-radius: 8px; padding: 12px 14px; margin: 22px 0; font: 14px/1.5 "Segoe UI", system-ui, sans-serif; word-break: break-word; }
+.doc table { border-collapse: collapse; margin: 0 0 22px; font-size: 15px; display: block; overflow-x: auto; }
+.doc th, .doc td { border: 1px solid var(--doc-line); padding: 6px 10px; text-align: left; }
+
+/* code */
+.doc code { font-family: "Cascadia Code", Consolas, ui-monospace, monospace; font-size: .86em; background: var(--doc-code-bg); padding: 1px 5px; border-radius: 4px; }
+.doc pre { position: relative; background: var(--doc-code-bg); border-radius: 8px; padding: 14px 16px; margin: 0 0 22px;
+  font: 13px/1.55 "Cascadia Code", Consolas, ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
+.doc pre[data-lang]::before { content: attr(data-lang); display: block; font: 600 10.5px/1 "Segoe UI", system-ui, sans-serif;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--doc-faint); margin-bottom: 10px; }
+.doc pre code { background: none; padding: 0; font-size: inherit; }
+.doc .hljs-keyword, .doc .hljs-selector-tag, .doc .hljs-built_in, .doc .hljs-literal { color: var(--tok-keyword); }
+.doc .hljs-string, .doc .hljs-regexp, .doc .hljs-addition, .doc .hljs-template-string { color: var(--tok-string); }
+.doc .hljs-number, .doc .hljs-symbol, .doc .hljs-bullet { color: var(--tok-number); }
+.doc .hljs-comment, .doc .hljs-quote, .doc .hljs-deletion { color: var(--tok-comment); font-style: italic; }
+.doc .hljs-title, .doc .hljs-section, .doc .hljs-function .hljs-title { color: var(--tok-title); }
+.doc .hljs-type, .doc .hljs-class .hljs-title, .doc .hljs-title.class_ { color: var(--tok-type); }
+.doc .hljs-attr, .doc .hljs-attribute, .doc .hljs-variable, .doc .hljs-template-variable, .doc .hljs-name, .doc .hljs-selector-class { color: var(--tok-attr); }
+.doc .hljs-meta, .doc .hljs-params, .doc .hljs-property { color: var(--tok-meta); }
+.doc .hljs-emphasis { font-style: italic; }
+.doc .hljs-strong { font-weight: 700; }
+
+/* math */
+.doc .katex { font-size: 1.08em; }
+.doc .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+
+/* highlights */
+.doc mark.hl { color: inherit; border-radius: 2px; cursor: pointer; padding: 1px 0; background: rgba(255, 210, 40, .42); }
+.doc mark.hl.hl-green { background: rgba(70, 200, 120, .34); }
+.doc mark.hl.hl-blue { background: rgba(90, 150, 255, .32); }
+.doc mark.hl.hl-pink { background: rgba(255, 105, 170, .32); }
+.doc mark.hl.has-note { box-shadow: inset 0 -2px 0 rgba(127, 127, 127, .75); }
+.doc mark.hl.flash { animation: hl-flash 1s ease-out 2; }
+@keyframes hl-flash { 50% { filter: brightness(.75) saturate(1.8); } }
+
+/* the printed PDF: one continuous page */
+body.print { margin: 0; background: #fff; }
+body.print .doc { max-width: none; padding: 44px 48px 60px; }

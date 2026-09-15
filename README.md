@@ -3,7 +3,10 @@
 A local, curated library of Medium articles. Articles are organized by topic and subtopic and saved as clean PDFs.
 
 ```
-click article → Medium link → freedium-mirror.cfd → headless Chromium → Medium-Library/<topic>/<subtopic>/<title>.pdf → shown in the app
+click article → check the story on Medium
+    free story                     → rendered from Medium's own page ─┐
+    member-only / paywalled (402)  → freedium-mirror.cfd              ├→ headless Chromium → Medium-Library/<topic>/<subtopic>/<title>.pdf
+    Medium refuses the request     → freedium-mirror.cfd             ─┘
 ```
 
 ## Run
@@ -25,12 +28,31 @@ Then open http://127.0.0.1:8765. On first run, `run.bat` creates `.venv`, instal
 - **Library tab**: your saved articles. Articles that already have a PDF open instantly from disk. Click **Re-download** in the reader to get a fresh copy.
 - **Custom topics**: click **+ New topic** to create one under `custom/`, or click **+ Add subtopic** inside any topic. Only custom subtopics can be deleted.
 
+## Reading, highlights, and notes
+
+When you open an article, the app saves it into its own folder: `Medium-Library/<topic>/<subtopic>/<title>/`.
+
+- `content.html` is a clean copy of the article. The reader shows it as one continuous scroll.
+- `images/` holds the article's images, downloaded once so the article works offline.
+- `article.pdf` is the same article as a single continuous PDF page, with no page breaks. Very long articles open fine in browsers but can exceed Adobe Acrobat's 200-inch page limit.
+
+**Math and code:** LaTeX renders with KaTeX. It recognizes `$$…$$`, `\[…\]`, `\(…\)`, and `$…$` when the contents look like TeX, so prices like "$5" stay plain text. Code blocks get syntax highlighting. Both libraries are stored in `static/vendor`, so they work offline.
+
+**Highlights:** select text to open a small toolbar. Pick a color or press **H**. Click a highlight to change its color, add a note, or delete it.
+
+**Notes:** the **Notes** panel lists every highlight in reading order and has a free-form notes box for the article. **Copy** exports your highlights and notes as Markdown.
+
+**Summarize:** select text, then click **✦ Summarize** or press **S**. ChatGPT opens with your study-notes prompt plus the selected text, and the prompt is also copied to your clipboard. For long selections, paste it with Ctrl+V. To change the prompt, click **Edit the summarize prompt** in the notes panel.
+
+Highlights and notes are saved in `notes/<article id>.json`, so they survive re-downloading or moving the article. Articles downloaded before the continuous reader existed are upgraded automatically the first time you open them. The **PDF** button opens the single-page PDF without the browser's toolbar or page thumbnails.
+
 ## Files
 
 | Path | What |
 |---|---|
 | `app.py` | FastAPI server: library API, Discover (RSS), job runner |
-| `pipeline.py` | Freedium → Playwright → PDF. Isolates the `<article>` and strips Freedium's toolbar and pop-ups |
+| `medium_render.py` | Checks each story on Medium. It renders free stories from the content embedded in the post page into clean HTML, and sends member-only stories (or ones Medium refuses) to Freedium |
+| `pipeline.py` | Playwright → PDF. Prints the Medium-rendered story, or loads the Freedium page and strips its toolbar and pop-ups |
 | `topics.py` | Default topic tree and Medium tags for each subtopic |
 | `static/` | The UI (plain HTML, CSS, and JS) |
 | `Medium-Library/` | Your PDFs, plus `library.json` (the index of topics and articles) |
@@ -61,6 +83,8 @@ While the server runs, `curator.py` keeps each subtopic stocked with trending Me
 - Posts are ranked by claps weighted by age, so fresh popular posts can outrank older ones.
 - The curator adds up to 12 articles per subtopic. After that, a clearly better post replaces the weakest article the curator added that you haven't downloaded. It never removes articles you added yourself or articles you downloaded.
 - Subtopics with fewer than 8 articles are filled quickly first. After that, the curator visits one subtopic every 2 minutes.
+- Each topic aims for at least 120 articles. Its subtopics share that target, with at least 12 each. When a subtopic runs out of candidates, the other subtopics in that topic make up the difference.
+- Every article shows whether it is **🔒 Member-only** (paywalled) or **Free**. The status comes from the story's Medium page. A background check fills it in for older articles and refreshes their clap counts. Use the **All / Free / Member-only** filters above any list to show just one kind.
 - Articles added in the last 24 hours show a **New** badge, and the page refreshes itself when the library changes.
 - To turn this off, click the index panel in the sidebar and clear **Keep adding trending articles automatically**.
 

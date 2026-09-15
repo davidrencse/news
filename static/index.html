@@ -5,7 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Medium Library</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+  <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/static/article.css">
   <link rel="stylesheet" href="/static/style.css">
+  <script>
+    // applied before paint so a saved theme doesn't flash; app.js owns the toggle
+    try { const t = JSON.parse(localStorage.getItem('theme')); if (t) document.documentElement.dataset.theme = t; } catch {}
+  </script>
 </head>
 <body>
 <div class="app">
@@ -13,6 +19,7 @@
     <div class="brand">
       <span class="logo">M</span>
       <div><b>Medium Library</b><small>curated · offline · PDF</small></div>
+      <button id="themeBtn" class="btn ghost icon theme-btn" title="Toggle light/dark mode" aria-label="Toggle light/dark mode">◐</button>
     </div>
     <nav id="tree" class="tree" aria-label="Topics"></nav>
     <div class="side-foot">
@@ -40,16 +47,18 @@
 
     <section id="reader" class="reader" hidden>
       <header class="reader-bar">
-        <button id="readerClose" class="btn ghost icon" title="Back to library (Esc)">←</button>
+        <button id="readerClose" class="btn ghost icon" title="Back to library (Esc)" aria-label="Back to library">←</button>
         <div class="reader-title">
           <b id="readerTitle"></b>
           <small id="readerMeta"></small>
         </div>
         <div class="reader-actions">
-          <a id="readerOpen" class="btn ghost" target="_blank" rel="noopener">Open PDF ↗</a>
-          <a id="readerOriginal" class="btn ghost" target="_blank" rel="noopener noreferrer">Medium ↗</a>
-          <button id="readerRefetch" class="btn ghost" title="Download a fresh copy via Freedium">Re-download</button>
+          <button id="readerNotes" class="btn small ghost" title="Highlights and notes" hidden>✎ Notes</button>
+          <a id="readerOpen" class="btn small ghost" target="_blank" rel="noopener" title="The article as one continuous PDF page">PDF</a>
+          <a id="readerOriginal" class="btn small ghost" target="_blank" rel="noopener noreferrer" title="Open on Medium">Medium ↗</a>
+          <button id="readerRefetch" class="btn small ghost" title="Download a fresh copy" aria-label="Download a fresh copy">⟳</button>
         </div>
+        <div class="read-progress"><span id="readProgress"></span></div>
       </header>
       <div id="readerBody" class="reader-body"></div>
     </section>
@@ -58,6 +67,21 @@
 
 <dialog id="dlg" class="dlg"><form method="dialog" id="dlgForm"></form></dialog>
 <div id="toast" class="toast" role="status" hidden></div>
+<div id="selTools" class="sel-tools" role="toolbar" aria-label="Selected text" hidden>
+  <button class="swatch hl-yellow" data-hl="yellow" title="Highlight (H)" aria-label="Highlight yellow"></button>
+  <button class="swatch hl-green" data-hl="green" title="Highlight green" aria-label="Highlight green"></button>
+  <button class="swatch hl-blue" data-hl="blue" title="Highlight blue" aria-label="Highlight blue"></button>
+  <button class="swatch hl-pink" data-hl="pink" title="Highlight pink" aria-label="Highlight pink"></button>
+  <span class="sep"></span>
+  <button data-act="note" title="Highlight and add a note (N)">✎ Note</button>
+  <button data-act="summarize" title="Summarize in ChatGPT (S)">✦ Summarize</button>
+  <button data-act="copy" title="Copy the selected text">Copy</button>
+</div>
+<div id="hlPop" class="hl-pop" hidden></div>
+<script src="/static/vendor/katex/katex.min.js"></script>
+<script src="/static/vendor/katex/auto-render.min.js"></script>
+<script src="/static/vendor/hljs/highlight.min.js"></script>
+<script src="/static/article.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
