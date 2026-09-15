@@ -501,6 +501,16 @@ def _fetch_endpoint_body(client, url):
     client.delete(f"/api/articles/{aid}")
 
 
+# The lifespan shutdown inside this test closes the shared PDF pipeline for the rest of the process,
+# so main() runs it after everything that still needs to render.
+def _closes_pipeline(fn):
+    fn.closes_pipeline = True
+    return fn
+
+
+test_fetch_endpoint = _closes_pipeline(test_fetch_endpoint)
+
+
 def test_web_app_surface():
     """What a phone needs to install the app and read offline."""
     client = TestClient(A.app)
@@ -669,6 +679,379 @@ def test_phone_ui():
         A.store.discard(a)
 
 
+def test_download_races():
+    """The curator runs while you read. Removing or rotating out an article mid-download must not
+    report success, and must not leave a folder nothing points at."""
+    if not BROWSER:
+        return
+    import asyncio
+    url = "https://medium.com/@a/removed-mid-download-a1a1a1a1a1a1"
+    PAGES[url] = post_page("a1a1a1a1a1a1", "Removed mid download", tags=("cybersecurity", "malware"))
+    a = A.create_article({"url": url, "topic": "cybersecurity", "subtopic": "malware",
+                          "title": "Removed mid download", "source": "auto"})
+    folder = A.abs_path(A.folder_rel(a))
+
+    # Remove the article exactly in the window: after the render finishes, before run_job files it.
+    # Sleeping for the same effect is a race against a warm browser, which wins.
+    real_render = A.pipeline.render
+
+    async def render_then_remove(*args, **kwargs):
+        meta = await real_render(*args, **kwargs)
+        A.remove_article(a)                 # exactly what the curator does when it rotates
+        return meta
+
+    async def run():
+        job = {"id": "race", "article_id": a["id"], "status": "running", "stage": "queued",
+               "started": time.time()}
+        A.pipeline.render = render_then_remove
+        try:
+            await A.run_job(job, a)
+        finally:
+            A.pipeline.render = real_render
+        return job
+
+    job = asyncio.run(asyncio.wait_for(run(), 180))
+    check("a download whose article vanished reports an error, not success",
+          job["status"] == "error", job["status"])
+    check("and says what happened", "removed from the library" in job.get("error", ""), job.get("error"))
+    check("no orphan folder is left behind", not os.path.isdir(folder), folder)
+    check("no scratch folder is left behind",
+          not [p for p in os.listdir(os.path.join(A.LIBRARY_DIR, "cybersecurity", "malware"))
+               if p.startswith(".incoming")])
+
+    # the curator must not pick a downloading article as the one to replace
+    busy = A.create_article({"url": "https://medium.com/@a/busy-b2b2b2b2b2b2", "topic": "cybersecurity",
+                             "subtopic": "malware", "title": "Busy", "source": "auto", "claps": 1})
+    idle = A.create_article({"url": "https://medium.com/@a/idle-c3c3c3c3c3c3", "topic": "cybersecurity",
+                             "subtopic": "malware", "title": "Idle", "source": "auto", "claps": 1})
+    busy["fetching"] = True
+    auto = [busy, idle]
+    replaceable = [x for x in auto if not x.get("pdf") and not x.get("fetching")]
+    check("an article being downloaded is not up for replacement", replaceable == [idle],
+          [x["title"] for x in replaceable])
+    A.store.discard(busy)
+    A.store.discard(idle)
+
+
+def test_offline_reading():
+    """Install the service worker, then pull the network and check the app still opens and the
+    article you had read is still readable. 127.0.0.1 counts as a secure origin, so this is the same
+    code path a phone runs."""
+    if not BROWSER:
+        return
+    import asyncio
+    import threading
+
+    import uvicorn
+    from playwright.async_api import async_playwright
+
+    url = "https://medium.com/@a/read-me-offline-909090909090"
+    PAGES[url] = post_page("909090909090", "Read me offline", tags=("cybersecurity", "malware"))
+    a = A.create_article({"url": url, "topic": "cybersecurity", "subtopic": "malware",
+                          "title": "Read me offline"})
+    rel = A.folder_rel(a)
+    asyncio.run(A.pipeline.render(url, A.abs_path(rel)))
+    with A.store.lock:
+        a["doc"], a["pdf"], a["fetched"] = f"{rel}/content.html", f"{rel}/article.pdf", A.now_iso()
+        A.store.save()
+
+    port = __import__("socket").socket()
+    port.bind(("127.0.0.1", 0))
+    port = port.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(A.app, host="127.0.0.1", port=port,
+                                           log_level="critical", lifespan="off"))
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.1)
+
+    async def drive():
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(**({"executable_path": _pipeline.CHROMIUM_PATH}
+                                              if _pipeline.CHROMIUM_PATH else {}))
+        ctx = await browser.new_context(service_workers="allow")
+        page = await ctx.new_page()
+        out = {}
+        try:
+            await page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+            out["registers"] = await page.evaluate(
+                "navigator.serviceWorker.ready.then(r => !!r.active).catch(() => false)")
+
+            # second load: the worker is in control and caches the stamped assets
+            await page.reload(wait_until="networkidle")
+            await page.wait_for_selector(".card", timeout=15000)
+            await page.click(".card-title")
+            await page.wait_for_selector("#doc", timeout=20000)
+            await page.wait_for_timeout(1200)          # let the article's files land in the cache
+
+            cached = await page.evaluate(
+                """async () => {
+                     const names = await caches.keys();
+                     const urls = [];
+                     for (const n of names) urls.push(...(await (await caches.open(n)).keys()).map(r => r.url));
+                     return urls;
+                   }""")
+            out["app_js_cached"] = any("/static/app.js?v=" in u for u in cached)
+            out["article_cached"] = any("/content.html" in u for u in cached)
+            out["one_app_js"] = sum("/static/app.js" in u for u in cached) <= 2  # bare + one stamp
+
+            # the PDF viewer asks for byte ranges; a 206 is a slice, and caching one corrupts the file
+            await page.evaluate(
+                f"""async () => {{
+                      await fetch('/files/{rel}/article.pdf', {{ headers: {{ Range: 'bytes=0-99' }} }});
+                    }}""")
+            await page.wait_for_timeout(500)
+            statuses = await page.evaluate(
+                """async () => {
+                     const c = await caches.open('files-v1');
+                     const out = [];
+                     for (const r of await c.keys()) out.push((await c.match(r)).status);
+                     return out;
+                   }""")
+            out["no_partials_cached"] = all(s == 200 for s in statuses)
+
+            await ctx.set_offline(True)
+            await page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
+            out["offline_app_loads"] = await page.evaluate("typeof S === 'object' && Array.isArray(S.articles)")
+            out["offline_has_articles"] = await page.evaluate("S.articles.length > 0")
+            out["offline_renders_cards"] = await page.is_visible(".card")
+            await page.click(".card-title")
+            await page.wait_for_selector("#doc", timeout=20000)
+            out["offline_article_opens"] = await page.is_visible("#doc")
+            out["offline_article_has_text"] = "A heading" in (await page.inner_text("#doc"))
+
+            # app.py stamps assets with the file's mtime, so an update changes every asset URL.
+            # Offline, those new URLs are not in the cache and must fall back to the stored version.
+            await ctx.set_offline(False)
+            os.utime(os.path.join(A.STATIC_DIR, "app.js"))      # "the app was updated"
+            await page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+            await ctx.set_offline(True)
+            await page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
+            out["offline_after_update"] = await page.evaluate(
+                "typeof S === 'object' && Array.isArray(S.articles)")
+            return out
+        finally:
+            await ctx.set_offline(False)
+            await ctx.close()
+            await browser.close()
+            await pw.stop()
+
+    try:
+        r = asyncio.run(asyncio.wait_for(drive(), 240))
+    finally:
+        server.should_exit = True
+
+    check("the service worker registers", r["registers"])
+    check("the stamped app.js is cached, not just the bare URL", r["app_js_cached"], r["app_js_cached"])
+    check("the article's saved copy is cached", r["article_cached"])
+    check("old versions of an asset don't pile up", r["one_app_js"])
+    check("byte-range replies are never cached", r["no_partials_cached"], r["no_partials_cached"])
+    check("the app still loads with no network", r["offline_app_loads"])
+    check("the library list survives offline", r["offline_has_articles"])
+    check("the cards render offline", r["offline_renders_cards"])
+    check("a saved article still opens offline", r["offline_article_opens"])
+    check("and its text is there", r["offline_article_has_text"])
+    check("it still loads offline after an app update changed every asset URL", r["offline_after_update"])
+
+    A.store.discard(a)
+
+
+def test_notes_survive_backgrounding():
+    """A note typed inside the save debounce must not be lost when the phone discards the page.
+    iOS backgrounds a tab with visibilitychange and can drop it without firing beforeunload."""
+    if not BROWSER:
+        return
+    import asyncio
+    import threading
+
+    import uvicorn
+    from playwright.async_api import async_playwright
+
+    url = "https://medium.com/@a/notes-survive-d4d4d4d4d4d4"
+    PAGES[url] = post_page("d4d4d4d4d4d4", "Notes survive", tags=("cybersecurity", "malware"))
+    a = A.create_article({"url": url, "topic": "cybersecurity", "subtopic": "malware",
+                          "title": "Notes survive"})
+    rel = A.folder_rel(a)
+    asyncio.run(A.pipeline.render(url, A.abs_path(rel)))
+    with A.store.lock:
+        a["doc"], a["pdf"], a["fetched"] = f"{rel}/content.html", f"{rel}/article.pdf", A.now_iso()
+        A.store.save()
+
+    port = __import__("socket").socket()
+    port.bind(("127.0.0.1", 0))
+    port = port.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(A.app, host="127.0.0.1", port=port,
+                                           log_level="critical", lifespan="off"))
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.1)
+
+    typed = "A note typed right before the app went away"
+
+    async def drive():
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(**({"executable_path": _pipeline.CHROMIUM_PATH}
+                                              if _pipeline.CHROMIUM_PATH else {}))
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+            await page.click(".card-title")
+            await page.wait_for_selector("#doc", timeout=20000)
+            await page.wait_for_timeout(600)
+            if not await page.is_visible("#freeNotes"):
+                await page.click("#readerNotes")
+                await page.wait_for_timeout(300)
+            await page.fill("#freeNotes", typed)
+            await page.wait_for_timeout(80)          # well inside the 700ms save debounce
+            await page.evaluate(
+                """() => {
+                     Object.defineProperty(document, 'visibilityState',
+                                           { value: 'hidden', configurable: true });
+                     document.dispatchEvent(new Event('visibilitychange'));
+                   }""")
+            await page.close(run_before_unload=False)  # the tab is reclaimed; no beforeunload
+            await asyncio.sleep(1.5)
+        finally:
+            await ctx.close()
+            await browser.close()
+            await pw.stop()
+
+    try:
+        asyncio.run(asyncio.wait_for(drive(), 180))
+    finally:
+        server.should_exit = True
+
+    path = A.notes_path(a["id"])
+    saved = json.load(open(path, encoding="utf-8"))["notes"] if os.path.exists(path) else None
+    check("a note typed just before the app is backgrounded still reaches the server",
+          saved == typed, repr(saved))
+    A.store.discard(a)
+
+
+def test_hostile_input():
+    """Everything a person can type, and everything a bad link can look like."""
+    client = TestClient(A.app)
+
+    def add(url):
+        return client.post("/api/articles", json={"url": url, "topic": "cybersecurity", "subtopic": "malware"})
+
+    for bad, why in [("not a url", "a typo"), ("", "nothing"), ("//evil.com/x", "no scheme"),
+                     ("https://", "no host"), ("https://nodot/x", "not a hostname")]:
+        check(f"{why} is refused, not saved as an article", add(bad).status_code == 400, add(bad).text[:80])
+    for scheme in ("javascript:alert(1)", "file:///etc/passwd", "data:text/html,<script>x</script>"):
+        r = add(scheme)
+        check(f"{scheme.split(':')[0]}: links are refused", r.status_code == 400, r.text[:80])
+
+    r = add("medium.com/@a/bare-host-111111111111")
+    check("a bare medium.com link gets https://", r.json()["url"].startswith("https://medium.com/"), r.text[:80])
+    r = add("HTTPS://Medium.COM/@a/Mixed-Case-222222222222/")
+    check("the host is lowercased and the trailing slash dropped",
+          r.json()["url"] == "https://medium.com/@a/Mixed-Case-222222222222", r.json()["url"])
+    r = add("https://user:secret@medium.com/@a/creds-333333333333")
+    check("credentials are stripped rather than stored", "secret" not in r.json()["url"], r.json()["url"])
+    for a in [x for x in list(A.store.data["articles"]) if "111111111111" in x["url"]
+              or "222222222222" in x["url"] or "333333333333" in x["url"]]:
+        A.store.discard(a)
+
+    # paging tokens come back to us from our own JSON, but nothing stops someone editing one
+    for token in ('{"offset":1e400}', '{}', "null", "[]", '{"offset":"abc"}', "notjson"):
+        r = client.get("/api/search", params={"q": "x", "next": token})
+        check(f"a bad paging token is a 400, not a crash: {token}", r.status_code == 400, r.status_code)
+    for token in ('{"offset":-5}', '{"offset":99999999999999999999}'):
+        r = client.get("/api/search", params={"q": "x", "next": token})
+        check(f"an out-of-range offset is clamped: {token}", r.status_code == 200, r.status_code)
+
+    for aid in ("../../etc/passwd", "..%2f..%2fetc%2fpasswd", "abc/../../x"):
+        check("notes can't be read outside the notes folder",
+              client.get(f"/api/articles/{aid}/notes").status_code == 404)
+    for path in ("/files/../library.json", "/files/..%2f..%2fapp.py", "/files/cybersecurity/../../app.py"):
+        check(f"{path} is refused", client.get(path).status_code == 404)
+
+
+def test_malformed_medium_page():
+    """meta_of turns an untrusted page's JSON into typed values. Nothing in there may crash the
+    download, or one odd post would take the whole article with it."""
+    def meta(fields):
+        page = ("<script>window.__APOLLO_STATE__ = "
+                + json.dumps({"Post:abc": {"title": "t", **fields}}) + "</script>")
+        state, post = medium_render.parse_post(page, "https://medium.com/@a/x-abc")
+        return medium_render.meta_of(state, post)
+
+    good = meta({"clapCount": 1234, "readingTime": 6.4, "firstPublishedAt": 1757000000000})
+    check("claps and reading time come through", good["claps"] == 1234 and good["reading_time"] == 6, good)
+    check("the date comes through", (good["published"] or "").startswith("2025-09-04"), good["published"])
+
+    for name, fields in [("claps of infinity", {"clapCount": 1e309}),
+                         ("claps as a word", {"clapCount": "lots"}),
+                         ("a reading time of infinity", {"readingTime": 1e400}),
+                         ("a negative prehistoric date", {"firstPublishedAt": -99999999999999}),
+                         ("a date of infinity", {"firstPublishedAt": 1e400}),
+                         ("tags that aren't a list", {"tags": "nope"}),
+                         ("a creator that points back at the post", {"creator": {"__ref": "Post:abc"}})]:
+        try:
+            m = meta(fields)
+            check(f"{name} is survivable", isinstance(m["claps"], int), m)
+        except Exception as e:
+            check(f"{name} is survivable", False, f"{type(e).__name__}: {e}")
+
+    for name, page in [("no embedded data", "<html><body>nothing</body></html>"),
+                       ("truncated json", '<script>window.__APOLLO_STATE__ = {"Post:x": {"title"'),
+                       ("a list, not an object", "<script>window.__APOLLO_STATE__ = [1,2,3]</script>"),
+                       ("two posts on one page",
+                        '<script>window.__APOLLO_STATE__ = {"Post:a":{"clapCount":1},"Post:b":{"clapCount":2}}</script>')]:
+        state, post = medium_render.parse_post(page, "https://medium.com/@a/x-zzz")
+        check(f"{name} means no post, so the story goes to Freedium", post is None, post)
+
+
+def test_rate_limiter():
+    """polite.py is the only thing between this app and a ban. Its arithmetic is worth pinning down."""
+    import threading
+
+    import polite as P
+
+    lim = P.HostLimiter(1.0)
+    lim.pushed_back(429, retry_after=2)
+    t0 = time.time()
+    lim.wait(priority=True)
+    check("a request someone is waiting on still respects Retry-After", time.time() - t0 >= 1.9,
+          round(time.time() - t0, 2))
+
+    lim2 = P.HostLimiter(1.0)
+    for _ in range(3):
+        lim2.pushed_back(429)
+    check("repeated pushback widens the gap", lim2.gap > 20, lim2.gap)
+    for _ in range(20):
+        lim2.succeeded()
+    check("the gap comes back to normal as requests succeed", lim2.gap == 1.0, lim2.gap)
+
+    lim3 = P.HostLimiter(1.0)
+    for _ in range(50):
+        lim3.pushed_back(429)
+    check("the gap is capped", lim3.gap == P.MAX_GAP, lim3.gap)
+    check("and so is the pause, so a bad hour doesn't freeze the app for the rest of the day",
+          lim3.pause_until - time.time() <= P.MAX_GAP + 1, round(lim3.pause_until - time.time()))
+
+    lim4 = P.HostLimiter(0.05)
+    stamps = []
+    threads = [threading.Thread(target=lambda: (lim4.wait(), stamps.append(time.time()))) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    stamps.sort()
+    check("concurrent background requests are still spaced out",
+          all(b - a >= 0.045 for a, b in zip(stamps, stamps[1:])),
+          [round(b - a, 3) for a, b in zip(stamps, stamps[1:])])
+
+    check("Medium's image CDN gets its own budget", P.site_of("miro.medium.com") == "miro.medium.com")
+    check("subdomains count against medium.com", P.site_of("MEDIUM.COM") == "medium.com")
+    check("a lookalike host does not", P.site_of("medium.com.attacker.net") == "medium.com.attacker.net")
+
+
 def test_damaged_library_recovers():
     """A truncated library.json must not stop the app from starting."""
     path = os.path.join(WORK, "damaged.json")
@@ -738,8 +1121,9 @@ def main():
         "2026-09-11", ["https://medium.com/@a/a-huge-malware-story-cafecafecafe"])
     # the crawler asks for this on startup; an empty list keeps it quiet during the tests
     PAGES["https://medium.com/sitemap/sitemap.xml"] = "<sitemapindex></sitemapindex>"
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
+    tests = [(n, f) for n, f in globals().items() if n.startswith("test_")]
+    tests.sort(key=lambda nf: getattr(nf[1], "closes_pipeline", False))  # stable: only these move
+    for name, fn in tests:
             print(f"\n{name[5:].replace('_', ' ')}")
             try:
                 fn()

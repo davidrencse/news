@@ -89,7 +89,10 @@ routes end to end: a free story rendered from Medium and a member-only one pulle
 each all the way to a real PDF. It also checks what happens when things go wrong — a deleted story,
 every mirror failing, Chromium being killed mid-session, four downloads at once, a damaged
 `library.json` — and drives the interface at iPhone size in a real browser to check the drawer, the
-reader and the tap targets.
+reader and the tap targets. It installs the service worker, pulls the network, and checks the app
+still opens and a saved article still reads; it feeds the API typos, other URL schemes, path
+traversal and edited paging tokens; and it hands the renderer malformed post data to make sure one
+odd page can't take an article down with it.
 
 The PDF and interface checks need Chromium (`playwright install chromium`, or point `CHROMIUM_PATH`
 at one you already have). Without it, those checks are skipped and the rest still run.

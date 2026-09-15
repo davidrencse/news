@@ -99,6 +99,7 @@ class Store:
         for a in self.data["articles"]:
             if a.get("claps") is not None and "source" not in a:
                 a["source"] = "auto"  # added by the curator before articles recorded their source
+            a.pop("fetching", None)  # no download survives a restart, so none of these flags are live
         self.merge_default_topics()
         self.reindex()
         threading.Thread(target=self._writer, daemon=True, name="library-writer").start()
@@ -248,13 +249,24 @@ def slugify(s, limit=70):
 
 
 def normalize_url(url):
+    """A clean https URL, or a 400 saying why not.
+
+    Without the host check, a typo ("not a url") or another scheme ("file:///etc/passwd") became
+    "https://not a url" and was saved as a perfectly real-looking article that could never load.
+    """
     url = url.strip()
     if not re.match(r"^https?://", url, re.I):
+        if re.match(r"^[a-z][a-z0-9+.-]*:", url, re.I):
+            raise HTTPException(400, "Only http and https links can be saved.")
         url = "https://" + url
     p = urlsplit(url)
-    if not p.netloc:
-        raise HTTPException(400, "That doesn't look like a URL.")
-    return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/"), "", ""))
+    # credentials are dropped rather than kept: no article link needs them, and library.json would
+    # be storing a password in plain text
+    hostport = p.netloc.rsplit("@", 1)[-1]
+    host = hostport.rsplit(":", 1)[0]
+    if "." not in host or not re.fullmatch(r"[a-z0-9.-]+", host, re.I):
+        raise HTTPException(400, "That doesn't look like a link to an article.")
+    return urlunsplit((p.scheme.lower(), hostport.lower(), p.path.rstrip("/"), "", ""))
 
 
 def article_id(url):
@@ -541,9 +553,11 @@ async def search_medium(q: str = "", next: str | None = None):
     if not q:
         raise HTTPException(400, "Type something to search for.")
     try:
+        # OverflowError: a token carrying 1e400 parses as inf, which int() refuses
         offset = int(json.loads(next)["offset"]) if next else 0
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, OverflowError):
         raise HTTPException(400, "Bad paging token.")
+    offset = max(0, min(offset, 100_000))
     res = await asyncio.to_thread(web_search, q, offset)
     items = [dict(it, id=article_id(it["url"]), saved=store.by_url(it["url"]) is not None) for it in res["items"]]
     return {"q": q, "items": items, "next": json.dumps(res["next"]) if res["next"] else None,
@@ -674,6 +688,11 @@ async def run_job(job, a):
         shutil.rmtree(incoming, ignore_errors=True)
         meta = await pipeline.render(a["url"], incoming, stage)
         with store.lock:
+            # The article can be deleted, or rotated out by the curator, while it is downloading.
+            # Writing its files in anyway would leave a folder nothing points at, and tell the reader
+            # the download worked when the article is gone.
+            if store.article(a["id"]) is not a:
+                raise PipelineError("This article was removed from the library while it was downloading.")
             if meta.get("title"):
                 a["title"] = meta["title"]
             rel = folder_rel(a)
@@ -682,11 +701,13 @@ async def run_job(job, a):
             elif a.get("pdf") and os.path.isfile(abs_path(a["pdf"])):
                 os.remove(abs_path(a["pdf"]))  # a download from before articles had folders
             shutil.rmtree(abs_path(rel), ignore_errors=True)
+            os.makedirs(os.path.dirname(abs_path(rel)), exist_ok=True)  # the article may have been moved
             os.replace(incoming, abs_path(rel))
             a["author"] = meta.get("author") or a["author"]
             a["snippet"] = a["snippet"] or meta.get("subtitle", "")
             a["doc"], a["pdf"], a["fetched"] = f"{rel}/content.html", f"{rel}/article.pdf", now_iso()
-            _exists_cache.pop(a["doc"], None), _exists_cache.pop(a["pdf"], None)  # these files just changed
+            _exists_cache.pop(a["doc"], None)   # these files just changed
+            _exists_cache.pop(a["pdf"], None)
             a["via"], a["via_reason"] = meta.get("route"), meta.get("reason")
             if meta.get("route") == "medium":
                 a["locked"] = False
@@ -701,6 +722,8 @@ async def run_job(job, a):
         job.update(status="error", error=f"{type(e).__name__}: {e}")
     finally:
         shutil.rmtree(incoming, ignore_errors=True)
+        with store.lock:
+            a.pop("fetching", None)
 
 
 @app.post("/api/articles/{aid}/fetch")
@@ -716,6 +739,8 @@ async def fetch_article(aid: str, force: bool = False):
     job = {"id": uuid.uuid4().hex[:10], "article_id": aid, "status": "running", "stage": "queued", "started": time.time()}
     prune_jobs()
     jobs[job["id"]] = job
+    with store.lock:
+        a["fetching"] = True  # the curator leaves this one alone until the download settles
     asyncio.create_task(run_job(job, a))
     return job
 

@@ -452,7 +452,8 @@ class Curator:
             if len(auto) < cap:
                 added += take(url, fields)
                 continue
-            replaceable = [a for a in auto if not a.get("pdf")]
+            # never take away an article someone downloaded, or is downloading right now
+            replaceable = [a for a in auto if not a.get("pdf") and not a.get("fetching")]
             weakest = min(replaceable, key=lambda a: trend_score(a.get("claps"), a.get("published")), default=None)
             if weakest and trend_score(m["claps"], m["published"]) > 1.2 * trend_score(weakest.get("claps"), weakest.get("published")):
                 drop(weakest)

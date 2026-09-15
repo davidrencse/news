@@ -13,6 +13,8 @@ const SHELL = `shell-${VERSION}`;
 const FILES = `files-${VERSION}`;
 const DATA = `data-${VERSION}`;
 
+// app.py stamps its own assets with ?v=<mtime>, so what the page asks for never matches these bare
+// URLs exactly. They are the offline fallback: see staticAsset() below.
 const SHELL_URLS = [
   '/',
   '/static/style.css',
@@ -42,11 +44,18 @@ self.addEventListener('activate', e => {
     .then(() => self.clients.claim()));
 });
 
+/* A partial response (206, from the browser's PDF viewer asking for a byte range) is a slice of a
+   file, not the file. Storing one and handing it back later as the whole thing corrupts the PDF. */
+const storable = res => res && res.status === 200 && res.type !== 'opaque';
+
+async function put(cacheName, req, res) {
+  if (storable(res)) (await caches.open(cacheName)).put(req, res.clone());
+  return res;
+}
+
 async function networkFirst(req, cacheName) {
   try {
-    const res = await fetch(req);
-    if (res.ok) (await caches.open(cacheName)).put(req, res.clone());
-    return res;
+    return await put(cacheName, req, await fetch(req));
   } catch (err) {
     const hit = await caches.match(req);
     if (hit) return hit;
@@ -57,9 +66,43 @@ async function networkFirst(req, cacheName) {
 async function cacheFirst(req, cacheName) {
   const hit = await caches.match(req);
   if (hit) return hit;
-  const res = await fetch(req);
-  if (res.ok) (await caches.open(cacheName)).put(req, res.clone());
-  return res;
+  return put(cacheName, req, await fetch(req));
+}
+
+/* /static/… carries ?v=<mtime>, so a changed file is a different URL and can never be served stale.
+   The flip side is that after an update the new URL is not in the cache: offline, fall back to any
+   version of the same path. Older stamps of a file are dropped once the new one is stored. */
+async function staticAsset(req) {
+  const hit = await caches.match(req);
+  if (hit) return hit;
+  try {
+    const res = await fetch(req);
+    if (storable(res)) {
+      const cache = await caches.open(SHELL);
+      await cache.put(req, res.clone());
+      const path = new URL(req.url).pathname;
+      for (const old of await cache.keys()) {
+        if (new URL(old.url).pathname === path && old.url !== req.url) await cache.delete(old);
+      }
+    }
+    return res;
+  } catch (err) {
+    const any = await caches.match(req, { ignoreSearch: true });
+    if (any) return any;
+    throw err;
+  }
+}
+
+/* The PDF viewer asks for byte ranges. Those are never cached (see storable), so offline the best
+   we can do is hand back the whole file — which a client asking for a range must accept. */
+async function rangeRequest(req) {
+  try {
+    return await fetch(req);
+  } catch (err) {
+    const whole = await caches.match(new Request(req.url, { headers: {} }));
+    if (whole) return whole;
+    throw err;
+  }
 }
 
 self.addEventListener('fetch', e => {
@@ -68,6 +111,10 @@ self.addEventListener('fetch', e => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;        // article images hosted on Medium: leave alone
 
+  if (req.headers.has('range')) {
+    e.respondWith(rangeRequest(req));
+    return;
+  }
   if (req.mode === 'navigate') {
     e.respondWith(networkFirst(req, SHELL).catch(() => caches.match('/')));
     return;
@@ -82,7 +129,6 @@ self.addEventListener('fetch', e => {
     return;
   }
   if (url.pathname.startsWith('/static/')) {
-    // the server stamps ?v=<mtime> on its own assets, so a cached copy is only ever the right one
-    e.respondWith(cacheFirst(req, SHELL));
+    e.respondWith(staticAsset(req));
   }
 });

@@ -1034,6 +1034,22 @@ function queueSave() {
   R.saveTimer = setTimeout(saveNotes, 700);
 }
 
+/* Flush on the way out. An ordinary fetch is cancelled when the page goes away, and iOS discards a
+   backgrounded tab without ever firing beforeunload — so notes typed inside the save debounce were
+   simply lost. keepalive lets the request outlive the page; it is capped at 64KB, and a body over
+   that is sent normally as a best effort. */
+function saveNotesNow() {
+  const a = R.article;
+  if (!a || !R.dirty) return;
+  R.dirty = false;
+  const raw = JSON.stringify({ notes: R.notes.notes || '', highlights: R.notes.highlights.map(({ _orphan, ...h }) => h) });
+  try {
+    fetch(`/api/articles/${a.id}/notes`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: raw, keepalive: raw.length < 60000,
+    });
+  } catch { /* the page is going away; there is nothing left to tell the user */ }
+}
+
 async function saveNotes() {
   clearTimeout(R.saveTimer);
   const a = R.article;
@@ -1051,7 +1067,10 @@ async function saveNotes() {
     toast(`Couldn't save notes: ${err.message}`);
   }
 }
-window.addEventListener('beforeunload', () => { if (R.dirty) saveNotes(); });
+// visibilitychange is the one a phone reliably fires (switching apps, locking the screen)
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveNotesNow(); });
+window.addEventListener('pagehide', saveNotesNow);
+window.addEventListener('beforeunload', saveNotesNow);
 
 /* ------------------------------------------------------------ dialogs */
 function dialog({ title, body, submit = 'Save', danger = false }) {
