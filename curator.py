@@ -240,8 +240,21 @@ class Curator:
 
     # ------------------------------------------------------------ loop
     def start(self):
-        threading.Thread(target=self._run, daemon=True, name="curator").start()
-        threading.Thread(target=self._backfill, daemon=True, name="paywall-check").start()
+        threading.Thread(target=self._guard(self._run), daemon=True, name="curator").start()
+        threading.Thread(target=self._guard(self._backfill), daemon=True, name="paywall-check").start()
+
+    def _guard(self, fn):
+        """Keep a background thread alive. An unexpected error restarts the loop instead of silently
+        ending it for the rest of the session — these threads are the library's only way to grow."""
+        def run():
+            while not self._stopping:
+                try:
+                    fn()
+                    return  # returned on its own: it is stopping
+                except Exception as e:
+                    self.error = f"{fn.__name__} restarted after {type(e).__name__}: {e}"
+                    time.sleep(30)
+        return run
 
     def stop(self):
         self._stopping = True

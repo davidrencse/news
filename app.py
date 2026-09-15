@@ -20,7 +20,7 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -91,21 +91,44 @@ class Store:
         self._stopping = False
         self._wake = threading.Event()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                self.data = json.load(f)
-            self.data.setdefault("topics", default_topics())
-            self.data.setdefault("articles", [])
-            for a in self.data["articles"]:
-                if a.get("claps") is not None and "source" not in a:
-                    a["source"] = "auto"  # added by the curator before articles recorded their source
-            self.merge_default_topics()
-        else:
-            self.data = {"topics": default_topics(), "articles": []}
-            self._dirty = True
+        self.data = self._load(path)
+        self.data.setdefault("topics", default_topics())
+        self.data.setdefault("articles", [])
+        self.data["articles"] = [a for a in self.data["articles"]
+                                 if isinstance(a, dict) and a.get("id") and a.get("url")]
+        for a in self.data["articles"]:
+            if a.get("claps") is not None and "source" not in a:
+                a["source"] = "auto"  # added by the curator before articles recorded their source
+        self.merge_default_topics()
         self.reindex()
         threading.Thread(target=self._writer, daemon=True, name="library-writer").start()
         self.flush()
+
+    def _load(self, path):
+        """The library, or an empty one if the file can't be read.
+
+        A half-written or damaged library.json must not stop the app from starting. The unreadable
+        file is kept next to it as library.json.broken-<time> so nothing is quietly thrown away.
+        """
+        if not os.path.exists(path):
+            self._dirty = True
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("library.json is not an object")
+            return data
+        except Exception as e:
+            kept = f"{path}.broken-{int(time.time())}"
+            try:
+                shutil.copy2(path, kept)
+            except Exception:
+                kept = "(could not be copied)"
+            print(f"\n  {os.path.basename(path)} could not be read ({type(e).__name__}: {e}).\n"
+                  f"  Starting with an empty library; the old file is kept at {kept}\n")
+            self._dirty = True
+            return {}
 
     # -------------------------------------------------- indexes
     def reindex(self):
@@ -749,6 +772,14 @@ app.mount("/files", StaticFiles(directory=LIBRARY_DIR), name="files")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.get("/sw.js")
+def service_worker():
+    """Served from the root so the worker's scope covers the whole app, not just /static/."""
+    with open(os.path.join(STATIC_DIR, "sw.js"), encoding="utf-8") as f:
+        return Response(f.read(), media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
 @app.get("/")
 def index():
     """index.html with each local asset URL stamped by its modification time, so the browser never
@@ -765,8 +796,29 @@ def index():
     return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
 
+def lan_address():
+    """This machine's address on the local network, for opening the app on a phone."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))  # no packets are sent; this just picks the outbound interface
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8765"))
-    print(f"\n  Medium Library -> http://127.0.0.1:{port}\n")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    # 0.0.0.0 so a phone on the same Wi-Fi can open the library. There is no login: anyone on that
+    # network can read it. Set HOST=127.0.0.1 to keep it to this machine.
+    host = os.environ.get("HOST", "0.0.0.0")
+    lan = lan_address() if host == "0.0.0.0" else None
+    print(f"\n  Medium Library -> http://127.0.0.1:{port}")
+    if lan:
+        print(f"  On your phone    -> http://{lan}:{port}   (same Wi-Fi; anyone on it can read your library)")
+        print("  In Safari, tap Share -> Add to Home Screen to install it as an app.")
+    print()
+    uvicorn.run(app, host=host, port=port, log_level="warning")

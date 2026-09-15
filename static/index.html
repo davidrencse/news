@@ -2,9 +2,20 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- viewport-fit=cover lets the layout run under the notch; the CSS pads with safe-area insets -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Medium Library</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+
+  <!-- installable on a phone home screen: Android/Chrome reads the manifest, iOS the apple-* tags -->
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Library">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
   <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/static/article.css">
   <link rel="stylesheet" href="/static/style.css">
@@ -15,7 +26,8 @@
 </head>
 <body>
 <div class="app">
-  <aside class="sidebar">
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="sidebar" class="sidebar">
     <div class="brand">
       <span class="logo">M</span>
       <div><b>Medium Library</b><small>curated · offline · PDF</small></div>
@@ -30,11 +42,13 @@
 
   <main class="main">
     <header class="topbar">
+      <button id="menuBtn" class="btn ghost icon menu-btn" aria-label="Topics" aria-expanded="false" aria-controls="sidebar">☰</button>
       <form id="searchForm" class="searchform" role="search">
         <input id="search" class="input search" type="search" placeholder="Search all of Medium…  (Enter)" autocomplete="off" aria-label="Search all of Medium">
       </form>
+      <button id="pasteBtn" class="btn ghost icon paste-btn" aria-label="Paste a Medium link" aria-expanded="false" aria-controls="pasteForm">＋</button>
       <form id="pasteForm" class="paste">
-        <input id="pasteUrl" class="input" placeholder="Paste a Medium article link…" required autocomplete="off">
+        <input id="pasteUrl" class="input" placeholder="Paste a Medium article link…" required autocomplete="off" inputmode="url">
         <select id="pasteDest" class="input" aria-label="Save to"></select>
         <button type="submit" class="btn primary">Add &amp; read</button>
       </form>

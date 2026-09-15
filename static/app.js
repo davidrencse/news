@@ -115,6 +115,42 @@ $('#tree').addEventListener('click', e => {
   select(t, s);
 });
 $('#newTopicBtn').onclick = () => newTopic('custom');
+
+/* ------------------------------------------------------------ phone layout
+   On a narrow screen the sidebar is a drawer and the paste form folds behind a button. Both are
+   plain CSS classes, so on a wide screen these handlers are harmless no-ops. */
+const isPhone = () => matchMedia('(max-width: 860px)').matches;
+
+function drawer(open) {
+  $('#sidebar').classList.toggle('open', open);
+  $('#scrim').hidden = !open;
+  $('#menuBtn').setAttribute('aria-expanded', String(open));
+  document.body.style.overflow = open ? 'hidden' : '';
+}
+$('#menuBtn').onclick = () => drawer(!$('#sidebar').classList.contains('open'));
+$('#scrim').onclick = () => drawer(false);
+// Picking a subtopic, or "All articles", navigates and closes the drawer. Tapping a topic only
+// expands it, so the drawer stays open for the subtopics it just revealed.
+$('#tree').addEventListener('click', e => {
+  const b = e.target.closest('.tree-item');
+  if (!b || e.target.closest('[data-add]')) return;
+  if (isPhone() && (b.dataset.s || b.classList.contains('tree-all'))) drawer(false);
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') drawer(false); });
+addEventListener('resize', () => { if (!isPhone()) drawer(false); });
+
+// Installed to a home screen, the app opens and reads saved articles without the server running.
+// Browsers only allow this over https or on localhost, so a plain LAN address just skips it.
+if ('serviceWorker' in navigator) {
+  addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
+
+$('#pasteBtn').onclick = () => {
+  const open = $('#pasteForm').classList.toggle('open');
+  $('#pasteBtn').setAttribute('aria-expanded', String(open));
+  if (open) $('#pasteUrl').focus();
+};
+
 $('#themeBtn').onclick = () => {
   const root = document.documentElement;
   const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
