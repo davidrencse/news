@@ -120,15 +120,19 @@ Search results are only links. Nothing downloads until you open an article.
 
 ## Always-fresh library
 
-While the server runs, `curator.py` keeps each subtopic stocked with trending Medium articles:
+While the server runs, `curator.py` keeps each subtopic stocked with trending **member-only** Medium
+articles. Free stories are skipped, and free ones already in the library are dropped — except any you
+added yourself or have already downloaded, which are never removed.
 
-- It visits one subtopic at a time. It finds candidates in the local index, reads a few post pages it hasn't seen before, and keeps posts whose Medium tags fit the subtopic.
+- It visits one subtopic at a time. It finds candidates in the local index, reads a few post pages it hasn't seen before, and keeps member-only posts whose Medium tags fit the subtopic.
 - Posts are ranked by claps weighted by age, so fresh popular posts can outrank older ones.
 - The curator adds up to its subtopic's share of the topic target. After that, a clearly better post replaces the weakest article the curator added that you haven't downloaded. It never removes articles you added yourself or articles you downloaded.
 - Subtopics with fewer than 8 articles are filled quickly first. After that, the curator visits one subtopic every 2 minutes.
 - Each topic aims for at least 1,120 articles. Its subtopics share that target, with at least 12 each. When a subtopic runs out of candidates, the other subtopics in that topic make up the difference.
 - That target is a ceiling the curator walks towards, not a download. Every post page it reads goes through the shared rate limiter at about one request a second, so a fresh library fills over days of uptime, and only articles you actually open are turned into PDFs.
-- Every article shows whether it is **🔒 Member-only** (paywalled) or **Free**. The status comes from the story's Medium page. A background check fills it in for older articles and refreshes their clap counts. Use the **All / Free / Member-only** filters above any list to show just one kind.
+- Every article shows whether it is **🔒 Member-only** (paywalled) or **Free**. The status comes from the story's Medium page. A background check fills it in for older articles and refreshes their clap counts; when it finds that an auto-added article is actually free, it drops it. The **All / Free / Member-only** filters still work, so you can find any free articles you added yourself.
+- Because every article is paywalled, every download goes through Freedium. If the mirrors are down, nothing downloads — set `FREEDIUM_MIRRORS` to add alternatives.
+- To collect free articles too, set `MEMBER_ONLY = False` in `curator.py`.
 - Articles added in the last 24 hours show a **New** badge, and the page refreshes itself when the library changes.
 - To turn this off, click the index panel in the sidebar and clear **Keep adding trending articles automatically**.
 

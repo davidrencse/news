@@ -270,7 +270,8 @@ def test_curator():
           C.trend_score(1000, "2026-09-14T00:00:00+00:00") > C.trend_score(1000, "2025-01-01T00:00:00+00:00"))
 
     for u in [f"https://medium.com/@a/indexed-post-about-malware-{i:012x}" for i in range(30)]:
-        PAGES[u] = post_page(u[-12:], f"Malware post {u[-4:]}", tags=("cybersecurity", "malware"))
+        # member-only: a library set to MEMBER_ONLY is the only thing the curator will take
+        PAGES[u] = post_page(u[-12:], f"Malware post {u[-4:]}", tags=("cybersecurity", "malware"), locked=True)
     before = len(A.store.data["articles"])
     added, rotated, read = cur.curate("cybersecurity", sub, cap=10, filling=True)
     check("the curator adds articles it found in the index", added > 0, f"added={added} read={read}")
@@ -291,7 +292,8 @@ def test_curator():
         if a.get("source") == "auto":
             a["claps"] = 1
     hit = "https://medium.com/@a/a-huge-malware-story-cafecafecafe"
-    PAGES[hit] = post_page("cafecafecafe", "A huge malware story", claps=500000, tags=("cybersecurity", "malware"))
+    PAGES[hit] = post_page("cafecafecafe", "A huge malware story", claps=500000,
+                           tags=("cybersecurity", "malware"), locked=True)
     A.medium_index.crawl_day("2026-09-11", "https://medium.com/sitemap/posts/2026/posts-2026-09-11.xml")
     held = len([a for a in A.store.data["articles"] if a["subtopic"] == "malware"])
     added3, rotated, _ = cur.curate("cybersecurity", sub, cap=10, filling=True)
@@ -302,6 +304,67 @@ def test_curator():
     check("the new post is in the library", A.store.by_url(hit) is not None)
     check("the store indexes stay consistent after a rotation",
           len(A.store._by_id) == len(A.store.data["articles"]) == len(A.store._by_url))
+
+
+def test_member_only_library():
+    """The library collects paywalled stories only. Free ones are not added, and free ones already in
+    it are dropped — except the two kinds the app never takes away."""
+    check("the member-only policy is on", C.MEMBER_ONLY is True)
+
+    cur = A.curator
+    sub = {"id": "malware", "name": "Malware", "tags": ["malware"]}
+    urls = [f"https://medium.com/@a/how-to-spot-malware-in-the-wild-{i}-{i:012x}" for i in range(12)]
+    for i, u in enumerate(urls):  # half free, half member-only
+        PAGES[u] = post_page(f"{i:012x}", f"How to spot malware {i}", claps=900 + i,
+                             tags=("cybersecurity", "malware"), locked=(i % 2 == 0))
+    import sqlite3
+    db = sqlite3.connect(A.medium_index.path)
+    for u in urls:
+        row = db.execute("INSERT OR IGNORE INTO posts(url, day, prio) VALUES (?,?,?)",
+                         (u, "2026-09-12", 0.9))
+        if row.rowcount:
+            db.execute("INSERT INTO posts_fts(rowid, title, author) VALUES (?,?,?)",
+                       (row.lastrowid, u.rsplit("/", 1)[-1].replace("-", " ") + " malware", "a"))
+    db.commit()
+    db.close()
+
+    before = {a["url"] for a in A.store.data["articles"]}
+    cur.curate("cybersecurity", sub, cap=50, filling=True)
+    added = [a for a in A.store.data["articles"] if a["url"] not in before]
+    check("it added something", added, len(added))
+    check("everything it added is member-only", all(a.get("locked") is True for a in added),
+          [(a["title"], a.get("locked")) for a in added][:4])
+    check("no free story was added", not any(a.get("locked") is False for a in added))
+
+    # a library that already holds free articles of every kind
+    keep_mine = A.create_article({"url": "https://medium.com/@a/i-added-this-one-e1e1e1e1e1e1",
+                                  "topic": "cybersecurity", "subtopic": "malware",
+                                  "title": "I added this one", "locked": False})
+    keep_read = A.create_article({"url": "https://medium.com/@a/i-read-this-one-e2e2e2e2e2e2",
+                                  "topic": "cybersecurity", "subtopic": "malware", "source": "auto",
+                                  "title": "I read this one", "locked": False})
+    keep_read["pdf"] = "cybersecurity/malware/i-read-this-one/article.pdf"
+    drop_me = A.create_article({"url": "https://medium.com/@a/nobody-read-this-e3e3e3e3e3e3",
+                                "topic": "cybersecurity", "subtopic": "malware", "source": "auto",
+                                "title": "Nobody read this", "locked": False})
+    unchecked = A.create_article({"url": "https://medium.com/@a/status-unknown-e4e4e4e4e4e4",
+                                  "topic": "cybersecurity", "subtopic": "malware", "source": "auto",
+                                  "title": "Status unknown"})
+
+    dropped = cur.purge_free()
+    check("the free article nobody read is dropped", A.store.by_url(drop_me["url"]) is None)
+    check("one you added yourself is kept", A.store.by_url(keep_mine["url"]) is not None)
+    check("one you downloaded is kept", A.store.by_url(keep_read["url"]) is not None)
+    check("one whose status isn't known yet is kept until it is checked",
+          A.store.by_url(unchecked["url"]) is not None)
+    check("the sweep reports what it dropped", dropped >= 1, dropped)
+    check("no member-only article was touched",
+          all(a.get("locked") is not False or a.get("pdf") or a.get("source") != "auto"
+              for a in A.store.data["articles"]))
+
+    for a in [keep_mine, keep_read, unchecked] + added:
+        if A.store.by_url(a["url"]):
+            A.store.discard(A.store.by_url(a["url"]))
 
 
 def test_candidate_scan_deepens():

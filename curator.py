@@ -5,7 +5,9 @@ Each cycle takes the subtopic that was curated longest ago:
    whole window, best-rated by Medium's sitemap first.
 2. A few post pages it hasn't seen are read through polite.py (shared, self-throttling limiter),
    for the real title, author, claps, language and tags. Results are cached, so no page is read twice.
-3. Posts that fit the subtopic are ranked by trend: claps weighted down by age.
+3. Posts that fit the subtopic are ranked by trend: claps weighted down by age. With MEMBER_ONLY set,
+   only paywalled stories are kept; free ones are skipped, and any already in the library are dropped
+   unless you added them yourself or have downloaded them.
 4. Each topic aims for TOPIC_TARGET articles, shared by its subtopics (at least CAP each). Past its
    share, a clearly better post replaces the weakest auto-added article you never downloaded.
    Articles you added yourself or downloaded are never removed.
@@ -31,6 +33,7 @@ from datetime import date, datetime, timedelta, timezone
 import medium_render
 import polite
 
+MEMBER_ONLY = True     # the library collects paywalled stories only; free ones are not added and get dropped
 CAP = 12               # minimum auto-added articles kept per subtopic
 TOPIC_TARGET = 1120    # each topic aims for at least this many; its subtopics share the target
 PAGES_PER_CYCLE = 5    # post pages read per cycle
@@ -243,6 +246,28 @@ class Curator:
         threading.Thread(target=self._guard(self._run), daemon=True, name="curator").start()
         threading.Thread(target=self._guard(self._backfill), daemon=True, name="paywall-check").start()
 
+    def free_to_drop(self, articles):
+        """The auto-added free stories that should go, now that the library is member-only.
+
+        Two things are never taken away, the same two the rotation already protects: an article you
+        added yourself, and one you have downloaded. Those you chose; this is only clearing out the
+        free posts the curator put there on its own and nobody read.
+        """
+        if not MEMBER_ONLY:
+            return []
+        return [a for a in articles
+                if a.get("source") == "auto" and a.get("locked") is False and not a.get("pdf")]
+
+    def purge_free(self):
+        """Sweep the library once. Returns how many were dropped."""
+        with self.store.lock:
+            doomed = self.free_to_drop(list(self.store.data["articles"]))
+        for a in doomed:
+            self.remove_article(a)
+        if doomed:
+            self.store.save()
+        return len(doomed)
+
     def _guard(self, fn):
         """Keep a background thread alive. An unexpected error restarts the loop instead of silently
         ending it for the rest of the session — these threads are the library's only way to grow."""
@@ -268,6 +293,9 @@ class Curator:
 
     def _run(self):
         self._sleep(15)
+        dropped = self.purge_free()  # clear the free backlog once, before filling anything
+        if dropped:
+            print(f"  dropped {dropped:,} free articles; the library keeps member-only stories")
         while not self._stopping:
             if not self.enabled:
                 self._sleep(3600)
@@ -339,6 +367,11 @@ class Curator:
                 a["locked_checked"] = today
                 if meta and a.get("claps") is not None:
                     a["claps"] = max(a["claps"], meta["claps"])
+                # this is where an older article's status is settled, so it is also where a free one
+                # leaves a member-only library
+                drop = self.free_to_drop([a])
+            for gone in drop:
+                self.remove_article(gone)
             todo.pop()
             self.backfill_left = len(todo)
             changed += 1
@@ -420,7 +453,8 @@ class Curator:
             self.cache.save()
 
         good = [(u, m) for u in pool if (m := self.cache.get(u)) and m["title"] and m["lang"] in ("en", None)
-                and not m["response"] and fits(m, tid, sub, phrases)]
+                and not m["response"] and (m.get("locked") is True or not MEMBER_ONLY)
+                and fits(m, tid, sub, phrases)]
         good.sort(key=lambda x: trend_score(x[1]["claps"], x[1]["published"]), reverse=True)
 
         def take(url, fields):
