@@ -43,6 +43,27 @@ def parse_post(page, url):
     return state, post
 
 
+def whole(value, limit=10 ** 12):
+    """A plain int from whatever the page's JSON held. inf, NaN, strings and absurd numbers all
+    become 0 rather than raising: this is the boundary where an untrusted page becomes typed data."""
+    try:
+        n = int(round(value) if isinstance(value, float) else value)  # 6.6 minutes is a 7-minute read
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return n if -limit <= n <= limit else 0
+
+
+def when(ms):
+    """An ISO timestamp from Medium's milliseconds, or None if it isn't a real date."""
+    ms = whole(ms, 10 ** 15)  # milliseconds since 1970, so well past 10**12
+    if ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec="seconds")
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
 def meta_of(state, post):
     creator = deref(state, post.get("creator"))
     tags = []
@@ -50,16 +71,15 @@ def meta_of(state, post):
         ref = t.get("__ref", "") if isinstance(t, dict) else ""
         tags.append(state.get(ref, {}).get("id") or ref.split(":", 1)[-1])
     image = (post.get("previewImage") or {}).get("id")
-    ts = post.get("firstPublishedAt")
     subtitle = ((post.get("extendedPreviewContent") or {}).get("subtitle") or "").strip()
     return {
         "title": (post.get("title") or "").strip(),
         "subtitle": subtitle,
         "snippet": subtitle,
         "author": creator.get("name") or "",
-        "published": datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat(timespec="seconds") if ts else None,
-        "claps": int(post.get("clapCount") or 0),
-        "reading_time": round(post.get("readingTime") or 0),
+        "published": when(post.get("firstPublishedAt")),
+        "claps": whole(post.get("clapCount"), 10 ** 9),
+        "reading_time": whole(post.get("readingTime"), 10 ** 4),
         "lang": post.get("detectedLanguage"),
         "locked": bool(post.get("isLocked")),
         "response": bool(post.get("inResponseToPostResult")),

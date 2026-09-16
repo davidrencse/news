@@ -115,6 +115,42 @@ $('#tree').addEventListener('click', e => {
   select(t, s);
 });
 $('#newTopicBtn').onclick = () => newTopic('custom');
+
+/* ------------------------------------------------------------ phone layout
+   On a narrow screen the sidebar is a drawer and the paste form folds behind a button. Both are
+   plain CSS classes, so on a wide screen these handlers are harmless no-ops. */
+const isPhone = () => matchMedia('(max-width: 860px)').matches;
+
+function drawer(open) {
+  $('#sidebar').classList.toggle('open', open);
+  $('#scrim').hidden = !open;
+  $('#menuBtn').setAttribute('aria-expanded', String(open));
+  document.body.style.overflow = open ? 'hidden' : '';
+}
+$('#menuBtn').onclick = () => drawer(!$('#sidebar').classList.contains('open'));
+$('#scrim').onclick = () => drawer(false);
+// Picking a subtopic, or "All articles", navigates and closes the drawer. Tapping a topic only
+// expands it, so the drawer stays open for the subtopics it just revealed.
+$('#tree').addEventListener('click', e => {
+  const b = e.target.closest('.tree-item');
+  if (!b || e.target.closest('[data-add]')) return;
+  if (isPhone() && (b.dataset.s || b.classList.contains('tree-all'))) drawer(false);
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') drawer(false); });
+addEventListener('resize', () => { if (!isPhone()) drawer(false); });
+
+// Installed to a home screen, the app opens and reads saved articles without the server running.
+// Browsers only allow this over https or on localhost, so a plain LAN address just skips it.
+if ('serviceWorker' in navigator) {
+  addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
+
+$('#pasteBtn').onclick = () => {
+  const open = $('#pasteForm').classList.toggle('open');
+  $('#pasteBtn').setAttribute('aria-expanded', String(open));
+  if (open) $('#pasteUrl').focus();
+};
+
 $('#themeBtn').onclick = () => {
   const root = document.documentElement;
   const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
@@ -483,8 +519,8 @@ async function indexSettings() {
       <p class="hint" style="margin:0">Paywall status: ${(st.curator?.free || 0).toLocaleString()} free ·
         ${(st.curator?.member_only || 0).toLocaleString()} member-only${st.curator?.backfill_left ? ` · ${st.curator.backfill_left.toLocaleString()} still being checked` : ''}.</p>
       <label class="check"><input type="checkbox" name="curator" ${st.curator?.enabled ? 'checked' : ''}> Keep adding trending articles automatically</label>
-      <p class="hint">The curator visits one subtopic at a time, reads a few new posts, and adds the ones trending by claps.
-        Each topic aims for at least 120; once a subtopic has its share, better posts replace the weakest ones you haven't downloaded. It has added
+      <p class="hint">The curator visits one subtopic at a time, reads a few new posts, and adds the member-only ones trending by claps. Free stories are skipped, and free ones already saved are dropped unless you added or downloaded them.
+        Each topic aims for at least 1,120; once a subtopic has its share, better posts replace the weakest ones you haven't downloaded. It has added
         ${(st.curator?.added_total || 0).toLocaleString()} and swapped ${(st.curator?.rotated_total || 0).toLocaleString()} so far.
         ${(st.network?.['medium.com']?.pushbacks || 0) ? `Medium has pushed back ${st.network['medium.com'].pushbacks} times this session; requests are spaced ${st.network['medium.com'].gap_s}s apart.` : ''}</p>
       ${st.error ? `<div class="warn">${esc(st.error)}</div>` : ''}
@@ -998,6 +1034,22 @@ function queueSave() {
   R.saveTimer = setTimeout(saveNotes, 700);
 }
 
+/* Flush on the way out. An ordinary fetch is cancelled when the page goes away, and iOS discards a
+   backgrounded tab without ever firing beforeunload — so notes typed inside the save debounce were
+   simply lost. keepalive lets the request outlive the page; it is capped at 64KB, and a body over
+   that is sent normally as a best effort. */
+function saveNotesNow() {
+  const a = R.article;
+  if (!a || !R.dirty) return;
+  R.dirty = false;
+  const raw = JSON.stringify({ notes: R.notes.notes || '', highlights: R.notes.highlights.map(({ _orphan, ...h }) => h) });
+  try {
+    fetch(`/api/articles/${a.id}/notes`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: raw, keepalive: raw.length < 60000,
+    });
+  } catch { /* the page is going away; there is nothing left to tell the user */ }
+}
+
 async function saveNotes() {
   clearTimeout(R.saveTimer);
   const a = R.article;
@@ -1015,7 +1067,10 @@ async function saveNotes() {
     toast(`Couldn't save notes: ${err.message}`);
   }
 }
-window.addEventListener('beforeunload', () => { if (R.dirty) saveNotes(); });
+// visibilitychange is the one a phone reliably fires (switching apps, locking the screen)
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveNotesNow(); });
+window.addEventListener('pagehide', saveNotesNow);
+window.addEventListener('beforeunload', saveNotesNow);
 
 /* ------------------------------------------------------------ dialogs */
 function dialog({ title, body, submit = 'Save', danger = false }) {

@@ -19,6 +19,26 @@ Double-click `run.bat`, or:
 
 Then open http://127.0.0.1:8765. On first run, `run.bat` creates `.venv`, installs `requirements.txt`, and downloads Chromium for Playwright.
 
+## On your phone
+
+The app serves the same pages to a phone, laid out for a small screen: the topic tree becomes a
+slide-over drawer, the paste box folds behind **＋**, and the reader fills the screen.
+
+1. Start the app on your computer. It prints a second address, like `http://192.168.1.24:8765`.
+2. Put the phone on the same Wi-Fi and open that address.
+3. In Safari, tap **Share → Add to Home Screen**. It then opens like an app, with its own icon and
+   no browser chrome. On Android, Chrome's **Install app** does the same.
+
+Once installed, the interface and every article you have opened are cached, so the app still opens
+and those articles still read when the computer is asleep. Searching, downloading and adding
+articles need the computer running.
+
+There is no login. Anyone on the same network can read your library, so use it on a network you
+trust, or set `HOST=127.0.0.1` to keep the app on your computer only.
+
+> iOS only installs web apps this way — an App Store build would need an Apple developer account
+> and a native wrapper, which this project doesn't have.
+
 ## Using it
 
 - **Search bar**: type anything and press Enter to search all of Medium. Results are links only; nothing downloads until you click **Read as PDF** (or the card). **Save link** stores the article without downloading it. Pick where results get saved with **Save to**. Matches already in your library appear first. Pasting a Medium URL into the search bar adds it directly.
@@ -54,13 +74,36 @@ Highlights and notes are saved in `notes/<article id>.json`, so they survive re-
 | `medium_render.py` | Checks each story on Medium. It renders free stories from the content embedded in the post page into clean HTML, and sends member-only stories (or ones Medium refuses) to Freedium |
 | `pipeline.py` | Playwright → PDF. Prints the Medium-rendered story, or loads the Freedium page and strips its toolbar and pop-ups |
 | `topics.py` | Default topic tree and Medium tags for each subtopic |
-| `static/` | The UI (plain HTML, CSS, and JS) |
+| `static/` | The UI (plain HTML, CSS, and JS), plus the web-app manifest, icons and service worker |
 | `Medium-Library/` | Your PDFs, plus `library.json` (the index of topics and articles) |
+| `selftest.py` | Offline self-test of the library API, search index, renderer and curator |
+
+## Checking the app still works
+
+`python selftest.py` runs the whole app against stubbed Medium pages and a stub Freedium mirror on
+localhost. It never touches the network and never writes to your library — it works in a temporary
+folder and prints a line per check.
+
+It covers the library API, the search index, the curator, the storage layer, and both article
+routes end to end: a free story rendered from Medium and a member-only one pulled through a mirror,
+each all the way to a real PDF. It also checks what happens when things go wrong — a deleted story,
+every mirror failing, Chromium being killed mid-session, four downloads at once, a damaged
+`library.json` — and drives the interface at iPhone size in a real browser to check the drawer, the
+reader and the tap targets. It installs the service worker, pulls the network, and checks the app
+still opens and a saved article still reads; it feeds the API typos, other URL schemes, path
+traversal and edited paging tokens; and it hands the renderer malformed post data to make sure one
+odd page can't take an article down with it.
+
+The PDF and interface checks need Chromium (`playwright install chromium`, or point `CHROMIUM_PATH`
+at one you already have). Without it, those checks are skipped and the rest still run.
 
 ## Settings
 
 - `FREEDIUM_BASE`: the mirror to use. Defaults to `https://freedium-mirror.cfd`. Change it if the mirror goes down, for example `set FREEDIUM_BASE=https://freedium.cfd`.
 - `PORT`: the server port. Defaults to `8765`.
+- `HOST`: what the server listens on. Defaults to `0.0.0.0` so a phone on the same Wi-Fi can reach it. Set it to `127.0.0.1` to keep the app on this computer.
+- `FREEDIUM_MIRRORS`: a comma-separated list of extra mirrors to try when `FREEDIUM_BASE` doesn't return the article. Setting it replaces the built-in fallback.
+- `CHROMIUM_PATH`: use a Chromium already installed on this machine instead of Playwright's copy.
 - **Storage location**: PDFs, `library.json`, and the search index are stored next to the app. If that drive has less than 10 GB free when the app starts, the app moves them to `E:\storage\medium-library` once and remembers that location in `data-location.txt`. To pick a location yourself, set `MEDIUM_LIBRARY_DATA`. Separately, the indexer pauses whenever its drive has less than 2 GB free.
 ## How search works
 
@@ -77,14 +120,19 @@ Search results are only links. Nothing downloads until you open an article.
 
 ## Always-fresh library
 
-While the server runs, `curator.py` keeps each subtopic stocked with trending Medium articles:
+While the server runs, `curator.py` keeps each subtopic stocked with trending **member-only** Medium
+articles. Free stories are skipped, and free ones already in the library are dropped — except any you
+added yourself or have already downloaded, which are never removed.
 
-- It visits one subtopic at a time. It finds candidates in the local index, reads a few post pages it hasn't seen before, and keeps posts whose Medium tags fit the subtopic.
+- It visits one subtopic at a time. It finds candidates in the local index, reads a few post pages it hasn't seen before, and keeps member-only posts whose Medium tags fit the subtopic.
 - Posts are ranked by claps weighted by age, so fresh popular posts can outrank older ones.
-- The curator adds up to 12 articles per subtopic. After that, a clearly better post replaces the weakest article the curator added that you haven't downloaded. It never removes articles you added yourself or articles you downloaded.
+- The curator adds up to its subtopic's share of the topic target. After that, a clearly better post replaces the weakest article the curator added that you haven't downloaded. It never removes articles you added yourself or articles you downloaded.
 - Subtopics with fewer than 8 articles are filled quickly first. After that, the curator visits one subtopic every 2 minutes.
-- Each topic aims for at least 120 articles. Its subtopics share that target, with at least 12 each. When a subtopic runs out of candidates, the other subtopics in that topic make up the difference.
-- Every article shows whether it is **🔒 Member-only** (paywalled) or **Free**. The status comes from the story's Medium page. A background check fills it in for older articles and refreshes their clap counts. Use the **All / Free / Member-only** filters above any list to show just one kind.
+- Each topic aims for at least 1,120 articles. Its subtopics share that target, with at least 12 each. When a subtopic runs out of candidates, the other subtopics in that topic make up the difference.
+- That target is a ceiling the curator walks towards, not a download. Every post page it reads goes through the shared rate limiter at about one request a second, so a fresh library fills over days of uptime, and only articles you actually open are turned into PDFs.
+- Every article shows whether it is **🔒 Member-only** (paywalled) or **Free**. The status comes from the story's Medium page. A background check fills it in for older articles and refreshes their clap counts; when it finds that an auto-added article is actually free, it drops it. The **All / Free / Member-only** filters still work, so you can find any free articles you added yourself.
+- Because every article is paywalled, every download goes through Freedium. If the mirrors are down, nothing downloads — set `FREEDIUM_MIRRORS` to add alternatives.
+- To collect free articles too, set `MEMBER_ONLY = False` in `curator.py`.
 - Articles added in the last 24 hours show a **New** badge, and the page refreshes itself when the library changes.
 - To turn this off, click the index panel in the sidebar and clear **Keep adding trending articles automatically**.
 

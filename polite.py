@@ -51,7 +51,10 @@ class HostLimiter:
             self.gap = min(MAX_GAP, self.gap * PUSHBACK.get(code, 2.0))
             self.pushbacks += 1
             self.last_pushback = time.time()
-            pause = retry_after if retry_after else (0 if code == 403 else self.gap * 10)
+            # A site's own Retry-After is honoured exactly. Our fallback guess is capped: gap * 10 at
+            # the maximum gap would sit out an hour and forty minutes, and the gap alone (up to
+            # MAX_GAP between requests) is already most of the backoff.
+            pause = retry_after if retry_after else (0 if code == 403 else min(MAX_GAP, self.gap * 10))
             self.pause_until = max(self.pause_until, time.time() + pause)
 
 

@@ -92,7 +92,18 @@ class MediumIndex:
 
     # ------------------------------------------------------------ crawler
     def start(self):
-        threading.Thread(target=self._run, daemon=True, name="medium-index").start()
+        threading.Thread(target=self._guarded_run, daemon=True, name="medium-index").start()
+
+    def _guarded_run(self):
+        """_run already handles the errors it expects. Anything else restarts the crawler rather than
+        leaving the index frozen for the rest of the session."""
+        while not self._stopping:
+            try:
+                self._run()
+                return
+            except Exception as e:
+                self.state["error"] = f"Indexer restarted after {type(e).__name__}: {e}"
+                time.sleep(30)
 
     def stop(self):
         self._stopping = True

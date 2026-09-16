@@ -20,7 +20,7 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -71,30 +71,134 @@ FEED_TTL = 15 * 60
 
 # ---------------------------------------------------------------- storage
 
+SAVE_DEBOUNCE = 1.5  # seconds; the curator saves thousands of times, the file is written once per burst
+
+
 class Store:
+    """library.json plus in-memory indexes by id and url.
+
+    The library grows to tens of thousands of articles, so nothing here may be linear per write:
+    lookups go through dicts, and save() marks the file dirty for a writer thread that rewrites it at
+    most every SAVE_DEBOUNCE seconds (atomically, via a temp file). flush() forces the write out.
+    """
+
     def __init__(self, path):
         self.path = path
         self.lock = threading.RLock()
+        self._write_lock = threading.Lock()  # one writer at a time; see flush()
         self.version = 0  # bumps on every save so the UI knows when to reload
+        self._dirty = False
+        self._stopping = False
+        self._wake = threading.Event()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                self.data = json.load(f)
-            for a in self.data["articles"]:
-                if a.get("claps") is not None and "source" not in a:
-                    a["source"] = "auto"  # added by the curator before articles recorded their source
-        else:
-            self.data = {"topics": default_topics(), "articles": []}
-            self.save()
+        self.data = self._load(path)
+        self.data.setdefault("topics", default_topics())
+        self.data.setdefault("articles", [])
+        self.data["articles"] = [a for a in self.data["articles"]
+                                 if isinstance(a, dict) and a.get("id") and a.get("url")]
+        for a in self.data["articles"]:
+            if a.get("claps") is not None and "source" not in a:
+                a["source"] = "auto"  # added by the curator before articles recorded their source
+            a.pop("fetching", None)  # no download survives a restart, so none of these flags are live
+        self.merge_default_topics()
+        self.reindex()
+        threading.Thread(target=self._writer, daemon=True, name="library-writer").start()
+        self.flush()
 
+    def _load(self, path):
+        """The library, or an empty one if the file can't be read.
+
+        A half-written or damaged library.json must not stop the app from starting. The unreadable
+        file is kept next to it as library.json.broken-<time> so nothing is quietly thrown away.
+        """
+        if not os.path.exists(path):
+            self._dirty = True
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("library.json is not an object")
+            return data
+        except Exception as e:
+            kept = f"{path}.broken-{int(time.time())}"
+            try:
+                shutil.copy2(path, kept)
+            except Exception:
+                kept = "(could not be copied)"
+            print(f"\n  {os.path.basename(path)} could not be read ({type(e).__name__}: {e}).\n"
+                  f"  Starting with an empty library; the old file is kept at {kept}\n")
+            self._dirty = True
+            return {}
+
+    # -------------------------------------------------- indexes
+    def reindex(self):
+        with self.lock:
+            self._by_id = {a["id"]: a for a in self.data["articles"]}
+            self._by_url = {a["url"]: a for a in self.data["articles"]}
+
+    def merge_default_topics(self):
+        """Add topics and subtopics introduced in topics.py since this library was created.
+
+        Existing entries keep their name and tags (the user may have edited them); nothing is removed,
+        so a topic dropped from the defaults keeps the articles already filed under it.
+        """
+        by_id = {t["id"]: t for t in self.data["topics"]}
+        for default in default_topics():
+            t = by_id.get(default["id"])
+            if not t:
+                self.data["topics"].append(default)
+                self._dirty = True
+                continue
+            have = {s["id"] for s in t["subtopics"]}
+            for s in default["subtopics"]:
+                if s["id"] not in have:
+                    t["subtopics"].append(s)
+                    self._dirty = True
+
+    # -------------------------------------------------- persistence
     def save(self):
+        """Mark the library changed. The writer thread puts it on disk within SAVE_DEBOUNCE seconds."""
         with self.lock:
             self.version += 1
-            tmp = self.path + ".tmp"
+            self._dirty = True
+        self._wake.set()
+
+    def flush(self):
+        """Write the library out now, if it changed.
+
+        The write lock is held across the whole write, so flush() never returns while another thread's
+        write is still in flight: when it returns, everything saved before the call is on disk.
+        """
+        with self._write_lock:
+            with self.lock:
+                if not self._dirty:
+                    return
+                blob = json.dumps(self.data, indent=2, ensure_ascii=False)
+                self._dirty = False
+            tmp = f"{self.path}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
+                f.write(blob)
             os.replace(tmp, self.path)
 
+    def _writer(self):
+        while not self._stopping:
+            self._wake.wait(SAVE_DEBOUNCE)
+            self._wake.clear()
+            try:
+                self.flush()
+            except Exception as e:  # a failed write must not kill the thread; the next one retries
+                print(f"  could not write {self.path}: {type(e).__name__}: {e}")
+                with self.lock:
+                    self._dirty = True
+                time.sleep(5)
+
+    def stop(self):
+        self._stopping = True
+        self._wake.set()
+        self.flush()
+
+    # -------------------------------------------------- lookups
     def topic(self, tid):
         return next((t for t in self.data["topics"] if t["id"] == tid), None)
 
@@ -103,7 +207,32 @@ class Store:
         return t and next((s for s in t["subtopics"] if s["id"] == sid), None)
 
     def article(self, aid):
-        return next((a for a in self.data["articles"] if a["id"] == aid), None)
+        return self._by_id.get(aid)
+
+    def by_url(self, url):
+        return self._by_url.get(url)
+
+    def add(self, a):
+        with self.lock:
+            self.data["articles"].insert(0, a)
+            self._by_id[a["id"]] = a
+            self._by_url[a["url"]] = a
+            self.save()
+
+    def discard(self, a):
+        """Remove exactly this article. False if it isn't in the library (already removed, or a copy
+        of a row rather than the row itself), so callers don't delete files that are still in use."""
+        with self.lock:
+            if self._by_id.get(a["id"]) is not a:
+                return False
+            del self._by_id[a["id"]]
+            self._by_url.pop(a["url"], None)
+            for i, x in enumerate(self.data["articles"]):  # by identity, not value
+                if x is a:
+                    del self.data["articles"][i]
+                    break
+            self.save()
+            return True
 
 
 store = Store(DB_PATH)
@@ -120,13 +249,24 @@ def slugify(s, limit=70):
 
 
 def normalize_url(url):
+    """A clean https URL, or a 400 saying why not.
+
+    Without the host check, a typo ("not a url") or another scheme ("file:///etc/passwd") became
+    "https://not a url" and was saved as a perfectly real-looking article that could never load.
+    """
     url = url.strip()
     if not re.match(r"^https?://", url, re.I):
+        if re.match(r"^[a-z][a-z0-9+.-]*:", url, re.I):
+            raise HTTPException(400, "Only http and https links can be saved.")
         url = "https://" + url
     p = urlsplit(url)
-    if not p.netloc:
-        raise HTTPException(400, "That doesn't look like a URL.")
-    return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/"), "", ""))
+    # credentials are dropped rather than kept: no article link needs them, and library.json would
+    # be storing a password in plain text
+    hostport = p.netloc.rsplit("@", 1)[-1]
+    host = hostport.rsplit(":", 1)[0]
+    if "." not in host or not re.fullmatch(r"[a-z0-9.-]+", host, re.I):
+        raise HTTPException(400, "That doesn't look like a link to an article.")
+    return urlunsplit((p.scheme.lower(), hostport.lower(), p.path.rstrip("/"), "", ""))
 
 
 def article_id(url):
@@ -161,10 +301,30 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+_exists_cache: dict[str, tuple[float, bool]] = {}
+EXISTS_TTL = 30  # seconds; /api/library would otherwise stat two files per article on every poll
+
+
+def downloaded(rel):
+    """os.path.exists(abs_path(rel)), cached briefly. Only downloads change these, and a download
+    rewrites the article's row anyway, so a stale 'yes' can't outlive the file by more than EXISTS_TTL."""
+    if not rel:
+        return False
+    hit = _exists_cache.get(rel)
+    now = time.time()
+    if hit and now - hit[0] < EXISTS_TTL:
+        return hit[1]
+    ok = os.path.exists(abs_path(rel))
+    if len(_exists_cache) > 100_000:  # a whole library's worth of stale paths, after moves and removals
+        _exists_cache.clear()
+    _exists_cache[rel] = (now, ok)
+    return ok
+
+
 def public(a):
     out = dict(a)
-    out["pdf_url"] = f"/files/{a['pdf']}" if a.get("pdf") and os.path.exists(abs_path(a["pdf"])) else None
-    out["doc_url"] = f"/files/{a['doc']}" if a.get("doc") and os.path.exists(abs_path(a["doc"])) else None
+    out["pdf_url"] = f"/files/{a['pdf']}" if downloaded(a.get("pdf")) else None
+    out["doc_url"] = f"/files/{a['doc']}" if downloaded(a.get("doc")) else None
     return out
 
 
@@ -267,6 +427,7 @@ async def lifespan(_app):
     curator.stop()
     medium_index.stop()
     pipeline.close()
+    store.stop()
 
 
 app = FastAPI(title="Medium Library", lifespan=lifespan)
@@ -298,7 +459,8 @@ class MoveIn(BaseModel):
 
 @app.get("/api/library")
 def get_library():
-    return {"topics": store.data["topics"], "articles": [public(a) for a in store.data["articles"]]}
+    with store.lock:  # the curator adds and removes articles from its own thread
+        return {"topics": store.data["topics"], "articles": [public(a) for a in store.data["articles"]]}
 
 
 @app.post("/api/topics")
@@ -344,7 +506,8 @@ def delete_subtopic(tid: str, sid: str):
     with store.lock:
         t["subtopics"].remove(sub)
         # articles are unfiled rather than lost; their PDFs stay on disk
-        store.data["articles"] = [a for a in store.data["articles"] if not (a["topic"] == tid and a["subtopic"] == sid)]
+        for a in [a for a in store.data["articles"] if a["topic"] == tid and a["subtopic"] == sid]:
+            store.discard(a)
         store.save()
     folder = os.path.join(LIBRARY_DIR, tid, sid)
     if os.path.isdir(folder) and not os.listdir(folder):
@@ -377,9 +540,8 @@ async def discover(tid: str, sid: str):
                 seen.add(it["url"])
                 items.append(it)
     items.sort(key=lambda i: i["published"] or "", reverse=True)
-    saved = {a["url"] for a in store.data["articles"]}
     for it in items:
-        it["saved"] = it["url"] in saved
+        it["saved"] = store.by_url(it["url"]) is not None
         it["id"] = article_id(it["url"])
     return {"tags": sub["tags"], "items": items, "errors": errors}
 
@@ -391,12 +553,13 @@ async def search_medium(q: str = "", next: str | None = None):
     if not q:
         raise HTTPException(400, "Type something to search for.")
     try:
+        # OverflowError: a token carrying 1e400 parses as inf, which int() refuses
         offset = int(json.loads(next)["offset"]) if next else 0
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, OverflowError):
         raise HTTPException(400, "Bad paging token.")
+    offset = max(0, min(offset, 100_000))
     res = await asyncio.to_thread(web_search, q, offset)
-    saved = {a["url"] for a in store.data["articles"]}
-    items = [dict(it, id=article_id(it["url"]), saved=it["url"] in saved) for it in res["items"]]
+    items = [dict(it, id=article_id(it["url"]), saved=store.by_url(it["url"]) is not None) for it in res["items"]]
     return {"q": q, "items": items, "next": json.dumps(res["next"]) if res["next"] else None,
             "provider": res["provider"], "notice": res["notice"], "index": res["index"]}
 
@@ -432,7 +595,7 @@ def create_article(fields):
     """Add an article, or return the one already saved with that URL. Used by the API and the curator."""
     url = normalize_url(fields["url"])
     with store.lock:
-        existing = next((a for a in store.data["articles"] if a["url"] == url), None)
+        existing = store.by_url(url)
         if existing:
             return existing
         a = {
@@ -447,16 +610,13 @@ def create_article(fields):
             a["source"] = fields["source"]
         if fields.get("locked") is not None:
             a["locked"] = bool(fields["locked"])  # True = member-only (paywalled)
-        store.data["articles"].insert(0, a)
-        store.save()
+        store.add(a)
     return a
 
 
 def remove_article(a):
-    with store.lock:
-        if a in store.data["articles"]:
-            store.data["articles"].remove(a)
-            store.save()
+    if not store.discard(a):
+        return
     if a.get("doc"):
         shutil.rmtree(abs_path(posixpath.dirname(a["doc"])), ignore_errors=True)
     elif a.get("pdf") and os.path.exists(abs_path(a["pdf"])):
@@ -506,6 +666,16 @@ def delete_article(aid: str):
     return {"ok": True}
 
 
+JOB_TTL = 3600  # finished jobs the UI may still poll for
+
+
+def prune_jobs():
+    """Drop finished jobs the UI has had its chance to read, so a long session doesn't grow forever."""
+    cutoff = time.time() - JOB_TTL
+    for jid in [j["id"] for j in jobs.values() if j["status"] != "running" and j["started"] < cutoff]:
+        jobs.pop(jid, None)
+
+
 async def run_job(job, a):
     def stage(s, **info):
         job["stage"] = s
@@ -518,6 +688,11 @@ async def run_job(job, a):
         shutil.rmtree(incoming, ignore_errors=True)
         meta = await pipeline.render(a["url"], incoming, stage)
         with store.lock:
+            # The article can be deleted, or rotated out by the curator, while it is downloading.
+            # Writing its files in anyway would leave a folder nothing points at, and tell the reader
+            # the download worked when the article is gone.
+            if store.article(a["id"]) is not a:
+                raise PipelineError("This article was removed from the library while it was downloading.")
             if meta.get("title"):
                 a["title"] = meta["title"]
             rel = folder_rel(a)
@@ -526,10 +701,13 @@ async def run_job(job, a):
             elif a.get("pdf") and os.path.isfile(abs_path(a["pdf"])):
                 os.remove(abs_path(a["pdf"]))  # a download from before articles had folders
             shutil.rmtree(abs_path(rel), ignore_errors=True)
+            os.makedirs(os.path.dirname(abs_path(rel)), exist_ok=True)  # the article may have been moved
             os.replace(incoming, abs_path(rel))
             a["author"] = meta.get("author") or a["author"]
             a["snippet"] = a["snippet"] or meta.get("subtitle", "")
             a["doc"], a["pdf"], a["fetched"] = f"{rel}/content.html", f"{rel}/article.pdf", now_iso()
+            _exists_cache.pop(a["doc"], None)   # these files just changed
+            _exists_cache.pop(a["pdf"], None)
             a["via"], a["via_reason"] = meta.get("route"), meta.get("reason")
             if meta.get("route") == "medium":
                 a["locked"] = False
@@ -544,6 +722,8 @@ async def run_job(job, a):
         job.update(status="error", error=f"{type(e).__name__}: {e}")
     finally:
         shutil.rmtree(incoming, ignore_errors=True)
+        with store.lock:
+            a.pop("fetching", None)
 
 
 @app.post("/api/articles/{aid}/fetch")
@@ -557,7 +737,10 @@ async def fetch_article(aid: str, force: bool = False):
     if running:
         return running
     job = {"id": uuid.uuid4().hex[:10], "article_id": aid, "status": "running", "stage": "queued", "started": time.time()}
+    prune_jobs()
     jobs[job["id"]] = job
+    with store.lock:
+        a["fetching"] = True  # the curator leaves this one alone until the download settles
     asyncio.create_task(run_job(job, a))
     return job
 
@@ -614,6 +797,14 @@ app.mount("/files", StaticFiles(directory=LIBRARY_DIR), name="files")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.get("/sw.js")
+def service_worker():
+    """Served from the root so the worker's scope covers the whole app, not just /static/."""
+    with open(os.path.join(STATIC_DIR, "sw.js"), encoding="utf-8") as f:
+        return Response(f.read(), media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
 @app.get("/")
 def index():
     """index.html with each local asset URL stamped by its modification time, so the browser never
@@ -630,8 +821,29 @@ def index():
     return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
 
+def lan_address():
+    """This machine's address on the local network, for opening the app on a phone."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))  # no packets are sent; this just picks the outbound interface
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8765"))
-    print(f"\n  Medium Library -> http://127.0.0.1:{port}\n")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    # 0.0.0.0 so a phone on the same Wi-Fi can open the library. There is no login: anyone on that
+    # network can read it. Set HOST=127.0.0.1 to keep it to this machine.
+    host = os.environ.get("HOST", "0.0.0.0")
+    lan = lan_address() if host == "0.0.0.0" else None
+    print(f"\n  Medium Library -> http://127.0.0.1:{port}")
+    if lan:
+        print(f"  On your phone    -> http://{lan}:{port}   (same Wi-Fi; anyone on it can read your library)")
+        print("  In Safari, tap Share -> Add to Home Screen to install it as an app.")
+    print()
+    uvicorn.run(app, host=host, port=port, log_level="warning")

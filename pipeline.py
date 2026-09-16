@@ -24,6 +24,12 @@ import medium_render
 import polite
 
 FREEDIUM_BASE = os.environ.get("FREEDIUM_BASE", "https://freedium-mirror.cfd").rstrip("/")
+# Mirrors tried in order when the one above doesn't return the article. Freedium mirrors come and go,
+# so a single dead host must not be the end of the paywalled route. Setting FREEDIUM_MIRRORS (a
+# comma-separated list) replaces the built-in fallback rather than adding to it.
+_EXTRA = [m.strip().rstrip("/") for m in os.environ.get("FREEDIUM_MIRRORS", "").split(",") if m.strip()]
+FREEDIUM_MIRRORS = list(dict.fromkeys([FREEDIUM_BASE] + (_EXTRA or ["https://freedium.cfd"])))
+CHROMIUM_PATH = os.environ.get("CHROMIUM_PATH")  # use a Chromium already on this machine
 MAX_PARALLEL = 2
 PAGE_WIDTH_PX = 794  # A4 width; the PDF is one page this wide and as tall as the article
 
@@ -99,13 +105,13 @@ def localize_images(content, out_dir):
         i, url = item
         try:
             data = polite.get(url, timeout=30, priority=True)
+            ext = next((e for magic, e in MAGIC if data.startswith(magic)), None) \
+                or os.path.splitext(urlsplit(url).path)[1][:5] or ".img"
+            os.makedirs(os.path.join(out_dir, "images"), exist_ok=True)
+            with open(os.path.join(out_dir, "images", f"{i:03d}{ext}"), "wb") as f:
+                f.write(data)
         except Exception:
-            return url, None
-        ext = next((e for magic, e in MAGIC if data.startswith(magic)), None) \
-            or os.path.splitext(urlsplit(url).path)[1][:5] or ".img"
-        os.makedirs(os.path.join(out_dir, "images"), exist_ok=True)
-        with open(os.path.join(out_dir, "images", f"{i:03d}{ext}"), "wb") as f:
-            f.write(data)
+            return url, None  # a missing image is not worth failing the article for; keep the online URL
         return url, f"images/{i:03d}{ext}"
 
     with ThreadPoolExecutor(6) as pool:
@@ -122,21 +128,57 @@ class PdfPipeline:
         self._pw = None
         self._browser = None
         self._sem = None
+        self._closed = False
+        # asyncio primitives belong to the loop that created them, so these are built on the Playwright
+        # loop rather than wherever the first render happens to come from.
+        self._launching = asyncio.run_coroutine_threadsafe(self._make_lock(), self._loop).result(10)
 
-    def freedium_url(self, medium_url: str) -> str:
-        return f"{FREEDIUM_BASE}/{medium_url}"
+    @staticmethod
+    async def _make_lock():
+        return asyncio.Lock()
+
+    def freedium_url(self, medium_url: str, base=None) -> str:
+        return f"{(base or FREEDIUM_BASE).rstrip('/')}/{medium_url}"
 
     async def render(self, medium_url: str, out_dir: str, on_stage=lambda stage, **info: None) -> dict:
         """Awaitable from any event loop; the work itself runs on the Playwright thread.
-        Writes content.html, images/ and article.pdf into out_dir and returns the article's metadata."""
-        fut = asyncio.run_coroutine_threadsafe(self._render(medium_url, out_dir, on_stage), self._loop)
-        return await asyncio.wrap_future(fut)
+        Writes content.html, images/ and article.pdf into out_dir and returns the article's metadata.
+
+        Retried once on a browser-level failure: Chromium can be killed by the OS or die on a bad page,
+        and the second attempt gets a freshly launched one rather than failing in the user's face.
+        """
+        if self._closed or not self._thread.is_alive():
+            raise PipelineError("The PDF engine is not running. Restart the app.")
+        for attempt in (1, 2):
+            fut = asyncio.run_coroutine_threadsafe(self._render(medium_url, out_dir, on_stage), self._loop)
+            try:
+                return await asyncio.wrap_future(fut)
+            except PipelineError:
+                raise  # the article itself is the problem; retrying changes nothing
+            except Exception as e:
+                if attempt == 2:
+                    raise PipelineError(f"The PDF engine failed twice: {type(e).__name__}: {e}") from e
+                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._drop_browser(), self._loop))
+
+    async def _drop_browser(self):
+        """Throw away the current browser so the next render launches a fresh one."""
+        browser, self._browser = self._browser, None
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass  # it is already gone; that is why we are here
 
     async def _ensure_browser(self):
-        if self._browser is None or not self._browser.is_connected():
+        # One launch at a time: without this, simultaneous downloads each start their own Chromium
+        # and all but the last are orphaned for the life of the process.
+        async with self._launching:
+            if self._browser is not None and self._browser.is_connected():
+                return
             if self._pw is None:
                 self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch()
+            self._browser = await self._pw.chromium.launch(
+                **({"executable_path": CHROMIUM_PATH} if CHROMIUM_PATH else {}))
             self._sem = self._sem or asyncio.Semaphore(MAX_PARALLEL)
 
     async def _render(self, medium_url, out_dir, on_stage):
@@ -157,7 +199,7 @@ class PdfPipeline:
                 else:
                     on_stage("freedium", route="freedium", reason=route["reason"],
                              freedium_url=self.freedium_url(medium_url))
-                    meta = await self._from_freedium(page, medium_url)
+                    meta = await self._from_freedium(page, medium_url, on_stage)
                     body = meta.pop("body")
                 content = medium_render.render_header(meta, medium_url, body, route["route"]) + "\n" + body
 
@@ -173,22 +215,34 @@ class PdfPipeline:
             finally:
                 await ctx.close()
 
-    async def _from_freedium(self, page, medium_url):
-        await asyncio.to_thread(polite.limiter(FREEDIUM_BASE).wait, True)  # space out hits on the free mirror
-        try:
-            await page.goto(self.freedium_url(medium_url), wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector("article h1", timeout=45000)
-        except Exception as e:
-            raise PipelineError(f"Freedium did not return the article ({type(e).__name__}). "
-                                "The mirror may be down or the link unsupported.") from e
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass  # long-polling pages never go idle; the article is already there
-        meta = await page.evaluate(SANITIZE_JS)
-        if not meta or not (meta.get("body") or "").strip():
-            raise PipelineError("Could not find the article body on the Freedium page.")
-        return meta
+    async def _from_freedium(self, page, medium_url, on_stage=None):
+        """Try each mirror in turn; a dead or empty one must not end the paywalled route."""
+        problems = []
+        for base in FREEDIUM_MIRRORS:
+            url = self.freedium_url(medium_url, base)
+            if on_stage:
+                on_stage("freedium", freedium_url=url)
+            await asyncio.to_thread(polite.limiter(base).wait, True)  # space out hits on the free mirror
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_selector("article h1", timeout=45000)
+            except Exception as e:
+                problems.append(f"{urlsplit(base).netloc}: {type(e).__name__}")
+                continue
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass  # long-polling pages never go idle; the article is already there
+            try:
+                meta = await page.evaluate(SANITIZE_JS)
+            except Exception as e:
+                problems.append(f"{urlsplit(base).netloc}: {type(e).__name__}")
+                continue
+            if meta and (meta.get("body") or "").strip():
+                return meta
+            problems.append(f"{urlsplit(base).netloc}: no article body")
+        raise PipelineError("No Freedium mirror returned the article (" + "; ".join(problems) + "). "
+                            "The mirrors may be down, or the link unsupported.")
 
     def _shell(self, content):
         asset = lambda rel: Path(self.assets_dir, *rel.split("/")).as_uri()
@@ -228,6 +282,8 @@ class PdfPipeline:
                 os.remove(shell)
 
     def close(self):
+        self._closed = True
+
         async def _close():
             if self._browser:
                 await self._browser.close()
