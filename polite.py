@@ -18,6 +18,7 @@ BASE_GAP = {"medium.com": 1.0, "freedium-mirror.cfd": 3.0, "miro.medium.com": 0.
 DEFAULT_GAP = 1.0
 MAX_GAP = 600.0
 PUSHBACK = {403: 1.5, 429: 3.0, 503: 3.0}  # how much each refusal slows that site down
+RECOVER_S = 60.0  # the extra gap halves after each minute without a pushback
 
 
 class HostLimiter:
@@ -28,11 +29,25 @@ class HostLimiter:
         self.pause_until = 0.0     # only set when the site pushes back
         self.pushbacks = 0
         self.last_pushback = None
+        self._recovered_at = 0.0
+        self.codes = {}            # refusals by HTTP status, for the status panel
         self._lock = threading.Lock()
+
+    def _recover(self, now):
+        """Halve the extra gap for every RECOVER_S without a pushback, so a burst of refusals doesn't
+        leave the site crawling for an hour (success-only recovery is slowest exactly when the gap is huge)."""
+        quiet_since = max(self.last_pushback or 0, self._recovered_at)
+        steps = (now - quiet_since) / RECOVER_S
+        if self.gap > self.base and self.last_pushback and steps >= 1:
+            self.gap = max(self.base, self.base + (self.gap - self.base) * 0.5 ** int(steps))
+            self._recovered_at = now
+            self.next_at = min(self.next_at, now + self.gap)  # drop slots booked at the old, longer gap
+            self.next_priority = min(self.next_priority, now + self.gap / 2)
 
     def wait(self, priority=False):
         with self._lock:  # reserve a slot, then sleep outside the lock
             now = time.time()
+            self._recover(now)
             if priority:
                 at = max(now, self.pause_until, self.next_priority)
                 self.next_priority = at + self.gap / 2
@@ -50,6 +65,7 @@ class HostLimiter:
         with self._lock:
             self.gap = min(MAX_GAP, self.gap * PUSHBACK.get(code, 2.0))
             self.pushbacks += 1
+            self.codes[code] = self.codes.get(code, 0) + 1
             self.last_pushback = time.time()
             # A site's own Retry-After is honoured exactly. Our fallback guess is capped: gap * 10 at
             # the maximum gap would sit out an hour and forty minutes, and the gap alone (up to
@@ -101,7 +117,10 @@ def get_text(url, timeout=40, priority=False):
 
 def status():
     now = time.time()
-    return {site: {"gap_s": round(l.gap, 1), "pushbacks": l.pushbacks,
+    for l in list(_limiters.values()):
+        with l._lock:
+            l._recover(now)
+    return {site: {"gap_s": round(l.gap, 1), "pushbacks": l.pushbacks, "codes": dict(l.codes),
                    "waiting_s": max(0, round(l.pause_until - now)),   # the site asked us to wait
                    "queued_s": max(0, round(l.next_at - now)),        # ordinary background queue
                    "slowed": l.gap > l.base * 1.5 or l.pause_until - now > 5}

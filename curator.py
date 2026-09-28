@@ -174,6 +174,10 @@ class MetaCache:
     def get(self, url):
         return self._data.get(url)
 
+    def items(self):
+        with self._lock:
+            return list(self._data.items())
+
     def set(self, url, meta):
         with self._lock:
             self._data[url] = meta
@@ -214,6 +218,7 @@ class Curator:
             st.setdefault("exhausted", {})
             st.setdefault("added", 0)
             st.setdefault("rotated", 0)
+            st.setdefault("goal", None)  # one-off bulk fill: {"free", "locked", "added_free", "added_locked", "started"}
             return st
 
     @property
@@ -226,6 +231,46 @@ class Curator:
             self.store.save()
         self._wake.set()
 
+    def set_goal(self, free, locked):
+        """Add `free` free and `locked` member-only articles on top of the usual targets (0, 0 cancels)."""
+        with self.store.lock:
+            st = self._state()
+            free, locked = max(0, int(free)), max(0, int(locked))
+            st["goal"] = {"free": free, "locked": locked, "added_free": 0, "added_locked": 0,
+                          "started": datetime.now(timezone.utc).isoformat(timespec="seconds")} if free or locked else None
+            if st["goal"]:
+                st["exhausted"] = {}  # every subtopic gets another look
+            self.store.save()
+        self._wake.set()
+
+    def goal(self):
+        return self._state()["goal"]
+
+    def _goal_extra(self, topics):
+        g = self.goal()
+        return math.ceil((g["free"] + g["locked"]) / max(1, topics)) if g else 0
+
+    def suggestions(self, limit=300):
+        """Trending posts the curator has already read that aren't in the library, each matched to the
+        first subtopic it fits. Built from the page cache only, so it costs no requests to Medium."""
+        with self.store.lock:
+            have = {a["url"] for a in self.store.data["articles"]}
+            subs = [(t["id"], s, phrases_for(t["id"], s)) for t in self.store.data["topics"] for s in t["subtopics"]
+                    if t["id"] != "custom" or s.get("tags")]
+        stamp = (len(self.cache), len(have))
+        if getattr(self, "_suggest", (None,))[0] != stamp:
+            out = []
+            for url, m in self.cache.items():
+                if not m or url in have or not m["title"] or m["lang"] not in ("en", None) or m["response"]:
+                    continue
+                home = next(((tid, sub) for tid, sub, ph in subs if fits(m, tid, sub, ph)), None)
+                if home:
+                    out.append(dict(m, url=url, topic=home[0], subtopic=home[1]["id"],
+                                    trend=round(trend_score(m["claps"], m["published"]), 2)))
+            out.sort(key=lambda x: x["trend"], reverse=True)
+            self._suggest = (stamp, out)
+        return self._suggest[1][:limit]
+
     def status(self):
         st = self._state()
         with self.store.lock:
@@ -236,7 +281,7 @@ class Curator:
         last_key = max(st["last"], key=st["last"].get) if st["last"] else None
         return {"enabled": st["enabled"], "current": self.current, "last": last_key,
                 "last_at": st["last"].get(last_key) if last_key else None,
-                "added_total": st["added"], "rotated_total": st["rotated"], "auto_articles": auto,
+                "goal": st["goal"], "added_total": st["added"], "rotated_total": st["rotated"], "auto_articles": auto,
                 "member_only": member_only, "free": free, "backfill_left": self.backfill_left,
                 "pages_cached": len(self.cache), "error": self.error,
                 "next_in_s": max(0, round(self.next_at - time.time())) if self.next_at else None}
@@ -398,12 +443,13 @@ class Curator:
         if not subs:
             return None
         exhausted = lambda k: st["exhausted"].get(k) == today
+        target = TOPIC_TARGET + self._goal_extra(len({t for t, _ in subs}))
         caps = {}
         for tid in {t for t, _ in subs}:
             keys = [f"{tid}/{s['id']}" for t, s in subs if t == tid]
             settled = sum(counts.get(k, 0) for k in keys if exhausted(k))
             active = [k for k in keys if not exhausted(k)] or keys
-            share = math.ceil(max(0, TOPIC_TARGET - settled) / len(active))
+            share = math.ceil(max(0, target - settled) / len(active))
             for k in keys:
                 caps[k] = max(CAP, share)
 
@@ -437,60 +483,96 @@ class Curator:
                     + candidates(db, phrases, have, POOL_SIZE - recent, None, scan))
         finally:
             db.close()
+        goal = self.goal()
+        if goal and len(pool) < 40:  # the index ran thin: also try posts already read, matched by their tags
+            wanted = set(sub.get("tags", [])) | TOPIC_TAGS.get(tid, set())
+            pool += [u for u, m in self.cache.items() if m and u not in have and wanted & set(m["tags"])]
         pool = list(dict.fromkeys(pool))
 
-        unread = [u for u in pool if u not in self.cache][:PAGES_PER_CYCLE * (4 if filling else 1)]
+        budget = PAGES_PER_CYCLE * (4 if filling else 1)
+        if goal and goal["added_locked"] < goal["locked"]:
+            budget = max(budget, 2 * PAGES_PER_CYCLE)  # member-only posts are scarcer; the limiter still paces reads
+        if goal:
+            ready = sum(1 for u in pool if (m := self.cache.get(u)) and m["title"] and m.get("locked") is not None
+                        and fits(m, tid, sub, phrases))
+            if ready >= 2 * ADDS_PER_CYCLE:
+                budget = 0  # enough already-read posts fit here; use them first
+        unread = [u for u in pool if u not in self.cache][:budget]
         for url in unread:
             try:
                 self.cache.set(url, post_meta(url))
             except urllib.error.HTTPError as e:
+                if e.code in (403, 429, 503):
+                    break  # Medium pushed back; leave the page uncached and finish this cycle with what we have
                 self.cache.set(url, None)
-                if e.code in (429, 503):
-                    break  # the limiter has slowed down; finish this cycle with what we have
             except Exception:
                 continue
         if unread:
             self.cache.save()
 
         good = [(u, m) for u in pool if (m := self.cache.get(u)) and m["title"] and m["lang"] in ("en", None)
-                and not m["response"] and (m.get("locked") is True or not MEMBER_ONLY)
+                and not m["response"] and (m.get("locked") is True or not MEMBER_ONLY
+                                          or (goal and goal["added_free"] < goal["free"]))
                 and fits(m, tid, sub, phrases)]
         good.sort(key=lambda x: trend_score(x[1]["claps"], x[1]["published"]), reverse=True)
+        if goal:  # only posts with a known paywall status count; alternate the two kinds until each side is met
+            sides = [[x for x in good if x[1].get("locked") is kind
+                      and goal["added_" + ("locked" if kind else "free")] < goal["locked" if kind else "free"]]
+                     for kind in (False, True)]
+            good = [x for pair in zip(*sides) for x in pair] + sides[0][len(sides[1]):] + sides[1][len(sides[0]):]
 
         def take(url, fields):
             """Add one post to the subtopic. add_article normalizes the URL, so what comes back can
             turn out to be an article we already hold; only a genuinely new one counts."""
             a = self.add_article(fields)
+            new = a["url"] not in have
             have.update((url, a["url"]))
-            if any(x is a for x in auto):
+            if not new:
                 return False
             auto.append(a)
             return True
 
         def drop(a):
+            if self.remove_article(a) is False:
+                return False
             for i, x in enumerate(auto):  # by identity: two articles can compare equal by value
                 if x is a:
                     del auto[i]
                     break
-            self.remove_article(a)
+            return True
 
         added = rotated = 0
         for url, m in good:
             if not filling and added + rotated >= ADDS_PER_CYCLE:
                 break
+            if goal:
+                side = "locked" if m.get("locked") else "free"
+                if goal["added_" + side] >= goal[side]:
+                    continue
             if url in have:
                 continue
             fields = {"url": url, "topic": tid, "subtopic": sub["id"], "title": m["title"], "author": m["author"],
                       "snippet": m["snippet"], "image": m["image"], "published": m["published"],
                       "claps": m["claps"], "source": "auto", "locked": m.get("locked")}
+            if goal and m.get("locked") is False:
+                fields["source"] = "bulk"  # explicitly requested free links survive the automatic free sweep
             if len(auto) < cap:
-                added += take(url, fields)
+                taken = take(url, fields)
+                added += taken
+                if goal and taken:
+                    with self.store.lock:
+                        goal["added_" + side] += 1
+                        if goal["added_free"] >= goal["free"] and goal["added_locked"] >= goal["locked"]:
+                            self._state()["goal"] = goal = None
+                            break
                 continue
-            # never take away an article someone downloaded, or is downloading right now
+            if goal:
+                break  # a bulk fill only adds; it never swaps out existing articles
             replaceable = [a for a in auto if not a.get("pdf") and not a.get("fetching")]
             weakest = min(replaceable, key=lambda a: trend_score(a.get("claps"), a.get("published")), default=None)
             if weakest and trend_score(m["claps"], m["published"]) > 1.2 * trend_score(weakest.get("claps"), weakest.get("published")):
-                drop(weakest)
+                if not drop(weakest):
+                    break
                 rotated += take(url, fields)
             else:
                 break  # everything after this ranks lower still

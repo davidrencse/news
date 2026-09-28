@@ -18,6 +18,8 @@ async function api(path, opts = {}) {
 }
 
 const PAGE = 60;  // library cards rendered at a time
+const skeleton = (n = 4, label = '') => (label ? `<div class="loading-line">${esc(label)}</div>` : '')
+  + Array.from({ length: n }, () => '<div class="card skel" aria-hidden="true"><div><i></i><i></i><i></i></div><i class="skel-img"></i></div>').join('');
 
 const S = {
   topics: [],
@@ -31,7 +33,11 @@ const S = {
   open: new Set(local.get('open', ['cybersecurity', 'artificial-intelligence'])),
   discover: {},          // "topic/sub" -> {items, errors, tags}
   reader: null,          // article currently shown
+  pendingRemovals: new Map(),  // id -> timer; removals wait a few seconds so they can be undone
   pollTimer: null,
+  sort: local.get('discoverSort', 'foryou'),  // Discover: 'foryou' (recommended) | 'trending'
+  labels: local.get('labels', []),            // Discover "For you": only posts with one of these labels
+  rec: null,             // {items, labels, top_labels, engaged} from /api/recommend
 };
 
 // "New" means added by the curator since the previous visit (nothing is new on a first visit).
@@ -50,10 +56,14 @@ const fmtDate = d => {
 const fmtCount = n => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}k` : (n || 0).toLocaleString());
 const sourceOf = u => { try { const p = new URL(u); return p.hostname === 'medium.com' ? `medium.com/${p.pathname.split('/')[1]}` : p.hostname; } catch { return ''; } };
 
-function toast(msg, ms = 2600) {
+function toast(msg, ms = 2600, action = null) {
   const el = $('#toast');
-  el.textContent = msg; el.hidden = false;
-  clearTimeout(toast.t); toast.t = setTimeout(() => (el.hidden = true), ms);
+  el.innerHTML = `<span>${esc(msg)}</span>${action ? `<button class="toast-act">${esc(action.label)}</button>` : ''}`;
+  const hide = () => { el.classList.add('hiding'); clearTimeout(toast.t); toast.t = setTimeout(() => (el.hidden = true), 180); };
+  if (action) el.querySelector('button').onclick = () => { hide(); action.run(); };
+  el.classList.remove('hiding');
+  el.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(hide, ms);
 }
 
 async function load() {
@@ -65,6 +75,8 @@ async function load() {
 }
 
 function select(t, s) {
+  if (!t || s) drawer(false);
+  if (S.sel.topic !== t || S.sel.sub !== s) $('.view').scrollTop = 0;
   S.sel = { topic: t, sub: s };
   if (!s) S.tab = 'library';
   S.mode = 'browse'; S.search = null; S.limit = PAGE; $('#search').value = '';
@@ -85,7 +97,11 @@ function renderTree() {
   }
   const isSel = (t, s) => S.mode === 'browse' && S.sel.topic === t && S.sel.sub === s;
   let h = `<button class="tree-item tree-all ${isSel(null, null) ? 'active' : ''}" data-t="" data-s="">
-    <span class="label">All articles</span><span class="count">${S.articles.length}</span></button>`;
+    <span class="label">All articles</span><span class="count">${S.articles.length}</span></button>
+    <button class="tree-item tree-all tree-discover ${S.mode === 'discover' ? 'active' : ''}" data-discover-all>
+    <span class="label">✦ Discover</span><span class="count">${S.suggest?.items ? S.suggest.items.length : ''}</span></button>
+    <button class="tree-item tree-all tree-notebook ${S.mode === 'notebook' ? 'active' : ''}" data-notebook>
+    <span class="label">✎ Notebook</span><span class="count">${S.articles.filter(a => a.notes_count).length || ''}</span></button>`;
   for (const t of S.topics) {
     const open = S.open.has(t.id);
     h += `<div class="${open ? 'open' : ''}" data-group="${esc(t.id)}">
@@ -104,6 +120,8 @@ function renderTree() {
 $('#tree').addEventListener('click', e => {
   const add = e.target.closest('[data-add]');
   if (add) return newTopic(add.dataset.add);
+  if (e.target.closest('[data-discover-all]')) return openDiscover();
+  if (e.target.closest('[data-notebook]')) return openNotebook();
   const b = e.target.closest('.tree-item');
   if (!b) return;
   const t = b.dataset.t || null, s = b.dataset.s || null;
@@ -151,6 +169,13 @@ $('#pasteBtn').onclick = () => {
   if (open) $('#pasteUrl').focus();
 };
 
+document.addEventListener('keydown', e => {
+  if (e.key !== '/' || e.ctrlKey || e.metaKey || S.reader || $('#dlg').open) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName)) return;
+  e.preventDefault();
+  $('#search').focus();
+  $('#search').select();
+});
 $('#themeBtn').onclick = () => {
   const root = document.documentElement;
   const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
@@ -173,6 +198,8 @@ function renderDest() { $('#pasteDest').innerHTML = destOptions(currentDest()); 
 /* ------------------------------------------------------------ header */
 function renderHead() {
   if (S.mode === 'search') return renderSearchHead();
+  if (S.mode === 'discover') return renderDiscoverHead();
+  if (S.mode === 'notebook') return renderNotebookHead();
   const t = topic(S.sel.topic), s = S.sel.sub && sub(S.sel.topic, S.sel.sub);
   const title = s ? s.name : t ? t.name : 'All articles';
   const crumb = ['Medium-Library', t?.id, s?.id].filter(Boolean).map(x => `<span>${esc(x)}</span>`).join('');
@@ -221,12 +248,43 @@ function visibleArticles() {
   return scopeArticles().filter(a => S.access === 'all' || (S.access === 'locked' ? a.locked === true : a.locked === false));
 }
 
+// Your own library is searched here in the browser, with the same idea the server uses on the
+// index: a title match counts for more than a mention in the snippet, words that sit together
+// count for more than words scattered apart, and everything that matches is ranked, not just
+// filtered. Quotes and -exclusions work the same way as they do on Medium-wide search.
+function queryParts(q) {
+  const phrases = [], plain = [], minus = [];
+  for (const tok of q.toLowerCase().match(/-?"[^"]*"|\S+/g) || []) {
+    const neg = tok.startsWith('-'), body = (neg ? tok.slice(1) : tok).replace(/^"|"$/g, '');
+    const ws = body.match(/[a-z0-9]+/g) || [];
+    if (!ws.length) continue;
+    if (neg) minus.push(...ws);
+    else if (ws.length > 1 && /^-?"/.test(tok)) phrases.push(ws.join(' '));
+    else plain.push(...ws);
+  }
+  return { phrases, plain, minus, words: [...plain, ...phrases.flatMap(p => p.split(' '))] };
+}
+
 function libraryMatches(q) {
-  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-  return S.articles.filter(a => {
-    const hay = `${a.title} ${a.author} ${a.snippet} ${a.topic} ${a.subtopic}`.toLowerCase();
-    return words.every(w => hay.includes(w));
-  });
+  const { phrases, plain, minus, words } = queryParts(q);
+  if (!words.length) return [];
+  const scored = [];
+  for (const a of S.articles) {
+    const title = (a.title || '').toLowerCase();
+    const rest = `${a.author || ''} ${a.snippet || ''} ${a.topic} ${a.subtopic}`.toLowerCase();
+    if (minus.some(w => title.includes(w) || rest.includes(w))) continue;
+    if (phrases.some(p => !title.includes(p) && !rest.includes(p))) continue;
+    const inTitle = words.filter(w => title.includes(w)).length;
+    const anywhere = words.filter(w => title.includes(w) || rest.includes(w)).length;
+    if (!anywhere) continue;
+    const order = plain.map(w => title.indexOf(w)).filter(i => i >= 0);
+    const span = order.length > 1 ? Math.max(...order) - Math.min(...order) + 1 : 1;
+    scored.push([2.5 * (anywhere / words.length) + 1.2 * (inTitle / words.length)
+      + 0.6 * (order.length > 1 ? order.length / span : 0)
+      + 0.5 * phrases.filter(p => title.includes(p)).length
+      + 0.3 * (a.fetched ? 1 : 0), a]);
+  }
+  return scored.sort((x, y) => y[0] - x[0] || (y[1].added || '').localeCompare(x[1].added || '')).map(s => s[1]);
 }
 
 function libraryCard(a, showLoc) {
@@ -245,7 +303,7 @@ function libraryCard(a, showLoc) {
         ${a.source === 'auto' && LAST_VISIT && a.added > LAST_VISIT ? '<span class="pill new">New</span>' : ''}
         ${a.locked === true ? '<span class="pill locked" title="Member-only story: the PDF is made through Freedium">🔒 Member-only</span>'
           : a.locked === false ? '<span class="pill free" title="Free story: the PDF is made straight from Medium">Free</span>' : ''}
-        ${a.pdf_url ? '<span class="pill ready">PDF saved</span>' : '<span class="pill online">Not downloaded</span>'}
+        ${a.pdf_url ? '<span class="pill ready" title="Saved on this computer; opens instantly">Saved offline</span>' : ''}
         ${showLoc && s ? `<span class="pill loc">${esc(t.name)} / ${esc(s.name)}</span>` : ''}
         ${a.notes_count ? `<span class="pill loc" title="Highlights and notes">✎ ${a.notes_count}</span>` : ''}
         <span class="card-actions">
@@ -260,6 +318,8 @@ function libraryCard(a, showLoc) {
 
 function renderList() {
   if (S.mode === 'search') return renderSearch();
+  if (S.mode === 'discover') return renderDiscoverAll();
+  if (S.mode === 'notebook') return renderNotebook();
   if (S.tab === 'discover' && S.sel.sub) return renderDiscover();
   const items = visibleArticles();
   if (!items.length && S.access !== 'all' && scopeArticles().length) {
@@ -284,6 +344,7 @@ $('#list').addEventListener('click', async e => {
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (card.dataset.result !== undefined) return onResultClick(card, act);
   if (card.dataset.discover !== undefined) return onDiscoverClick(card, act);
+  if (card.dataset.suggest !== undefined) return onSuggestClick(card, act);
   const a = S.articles.find(x => x.id === card.dataset.id);
   if (!a) return;
   if (act === 'move') return moveArticle(a);
@@ -297,7 +358,7 @@ $('#list').addEventListener('keydown', e => {
 async function loadDiscover(force = false) {
   const k = key(S.sel.topic, S.sel.sub);
   if (S.discover[k] && !force) return renderList();
-  $('#list').innerHTML = '<div class="loading">Fetching the latest stories from Medium…</div>';
+  $('#list').innerHTML = skeleton(4, 'Fetching the latest stories from Medium…');
   try {
     S.discover[k] = await api(`/api/discover/${encodeURIComponent(S.sel.topic)}/${encodeURIComponent(S.sel.sub)}`);
   } catch (err) {
@@ -308,7 +369,7 @@ async function loadDiscover(force = false) {
 
 function renderDiscover() {
   const d = S.discover[key(S.sel.topic, S.sel.sub)];
-  if (!d) { $('#list').innerHTML = '<div class="loading">Fetching the latest stories from Medium…</div>'; return; }
+  if (!d) { $('#list').innerHTML = skeleton(4, 'Fetching the latest stories from Medium…'); return; }
   const saved = new Set(S.articles.map(a => a.url));
   const warn = d.errors?.length ? `<div class="warn">Some tags failed: ${d.errors.map(esc).join(' · ')}</div>` : '';
   if (!d.items.length) {
@@ -325,7 +386,7 @@ function renderDiscover() {
         <h2 class="card-title">${esc(it.title)}</h2>
         ${it.snippet ? `<p class="card-snip">${esc(it.snippet)}</p>` : ''}
         <div class="card-foot">
-          <button class="btn small primary" data-act="read">Read as PDF</button>
+          <button class="btn small primary" data-act="read">Read</button>
           ${isSaved ? '<span class="pill ready">In library</span>' : '<button class="btn small" data-act="save">Save for later</button>'}
         </div>
       </div>
@@ -352,6 +413,316 @@ async function saveArticle(body) {
   } catch (err) { toast(err.message); return null; }
 }
 
+/* ------------------------------------------------------------ Discover: trending across every topic */
+// Posts the curator already read but didn't add. Served from its cache, so the page opens instantly.
+/* ------------------------------------------------------------ notebook: every article's summary and notes */
+const NB = { entries: null, q: '', error: null, timers: {} };
+
+async function openNotebook() {
+  closeReader();
+  drawer(false);
+  S.mode = 'notebook'; S.search = null; $('#search').value = '';
+  $('.view').scrollTop = 0;
+  render();
+  await loadNotebook();
+}
+
+async function loadNotebook() {
+  try {
+    NB.entries = (await api('/api/notebook')).entries; NB.error = null;
+  } catch (err) {
+    NB.entries = NB.entries || []; NB.error = err.message;
+  }
+  if (S.mode === 'notebook' && !S.reader) { renderTree(); renderHead(); renderList(); }
+}
+
+function notebookEntries() {
+  const q = NB.q.trim().toLowerCase();
+  return (NB.entries || []).filter(e => !q || [e.article.title, e.article.author, e.summary, e.notes,
+    ...e.highlights.flatMap(h => [h.quote, h.note])].some(x => (x || '').toLowerCase().includes(q)));
+}
+
+function renderNotebookHead() {
+  const n = NB.entries?.length ?? 0;
+  $('#viewHead').innerHTML = `
+    <div class="crumb"><span>Notebook</span><span>notes</span></div>
+    <div class="view-title"><h1>Notebook</h1></div>
+    <p class="lede">Summaries, notes and highlights from every article, saved on disk. Edit them here or in the reader's Notes panel.</p>
+    <div class="nb-tools">
+      <input id="nbSearch" class="input" type="search" placeholder="Filter ${n} ${n === 1 ? 'entry' : 'entries'}…" value="${esc(NB.q)}" autocomplete="off" aria-label="Filter notebook">
+      <button class="btn small ghost" id="nbCopyAll" ${n ? '' : 'disabled'}>Copy all as Markdown</button>
+    </div>`;
+  $('#nbSearch').oninput = e => { NB.q = e.target.value; renderNotebook(); };
+  $('#nbCopyAll').onclick = () => {
+    const md = notebookEntries().map(entryMarkdown).join('\n---\n\n');
+    navigator.clipboard.writeText(md).then(() => toast('Notebook copied as Markdown'), () => toast('Could not copy'));
+  };
+}
+
+function entryMarkdown(e) {
+  const hs = [...e.highlights].sort((x, y) => x.start - y.start);
+  return [`# ${e.article.title}`, e.article.url, '',
+    ...(e.summary.trim() ? ['## Summary', e.summary.trim(), ''] : []),
+    ...(e.notes.trim() ? ['## Notes', e.notes.trim(), ''] : []),
+    ...hs.flatMap(h => [`> ${h.quote.replace(/\s*\n+\s*/g, ' ')}`, ...(h.note?.trim() ? ['', h.note.trim()] : []), ''])].join('\n');
+}
+
+function renderNotebook() {
+  if (!NB.entries) { $('#list').innerHTML = skeleton(3, 'Loading notebook…'); return; }
+  const items = notebookEntries();
+  if (!items.length) {
+    $('#list').innerHTML = `<div class="empty"><b>${NB.entries.length ? 'No entries match' : 'Your notebook is empty'}</b>${NB.error ? esc(NB.error)
+      : NB.entries.length ? 'Try a different filter.' : 'Open an article, then use ✎ Notes to summarize it, take notes, or highlight passages. Everything shows up here.'}</div>`;
+    return;
+  }
+  $('#list').innerHTML = items.map(e => {
+    const a = e.article, t = topic(a.topic), s = sub(a.topic, a.subtopic);
+    const hs = [...e.highlights].sort((x, y) => x.start - y.start);
+    return `<article class="nb-entry" data-id="${esc(a.id)}">
+      <header class="nb-head">
+        <button class="nb-title" data-nb="open">${esc(a.title)}</button>
+        <small>${esc([t?.name, s?.name].filter(Boolean).join(' · '))}${a.author ? ` · ${esc(a.author)}` : ''} · edited ${esc(fmtDate(e.edited))}</small>
+      </header>
+      <label class="notes-label">Summary<textarea class="input notes-free nb-field" data-field="summary" rows="3"
+        placeholder="Open the article and use Draft key points, or write your own.">${esc(e.summary)}</textarea></label>
+      <label class="notes-label">Notes<textarea class="input notes-free nb-field" data-field="notes" rows="3" placeholder="Your notes…">${esc(e.notes)}</textarea></label>
+      ${hs.length ? `<details class="nb-hls"><summary>${hs.length} highlight${hs.length === 1 ? '' : 's'}</summary>
+        ${hs.map(h => `<div class="hl-item" style="--hl-color:${HL_COLORS[h.color] || HL_COLORS.yellow}"><q>${esc(h.quote)}</q>
+          ${h.note?.trim() ? `<div class="hl-note">${esc(h.note)}</div>` : ''}</div>`).join('')}</details>` : ''}
+      <footer class="nb-foot"><span class="saved-state"></span>
+        <button class="btn small ghost" data-nb="copy">Copy</button>
+        <button class="btn small" data-nb="open">Open article</button></footer>
+    </article>`;
+  }).join('');
+}
+
+$('#list').addEventListener('click', e => {
+  const act = e.target.closest('[data-nb]')?.dataset.nb;
+  const box = e.target.closest('.nb-entry');
+  const entry = act && box && NB.entries?.find(x => x.article.id === box.dataset.id);
+  if (!entry) return;
+  if (act === 'copy') {
+    navigator.clipboard.writeText(entryMarkdown(entry)).then(() => toast('Copied as Markdown'), () => toast('Could not copy'));
+    return;
+  }
+  flushNotebook();
+  openReader(S.articles.find(x => x.id === entry.article.id) || entry.article);
+});
+
+$('#list').addEventListener('input', e => {
+  const field = e.target.closest('.nb-field');
+  const box = field?.closest('.nb-entry');
+  const entry = box && NB.entries?.find(x => x.article.id === box.dataset.id);
+  if (!entry) return;
+  entry[field.dataset.field] = field.value;
+  box.querySelector('.saved-state').textContent = 'Saving…';
+  clearTimeout(NB.timers[entry.article.id]);
+  NB.timers[entry.article.id] = setTimeout(() => saveEntry(entry, box), 700);
+});
+
+async function saveEntry(entry, box) {
+  const id = entry.article.id;
+  delete NB.timers[id];
+  try {
+    const r = await api(`/api/articles/${id}/notes`, { method: 'PUT',
+      body: { notes: entry.notes, summary: entry.summary, highlights: entry.highlights } });
+    const listed = S.articles.find(x => x.id === id);
+    if (listed) listed.notes_count = r.notes_count;
+    box.querySelector('.saved-state').textContent = 'Saved';
+  } catch (err) {
+    box.querySelector('.saved-state').textContent = 'Not saved';
+    toast(`Couldn't save notes: ${err.message}`);
+  }
+}
+
+function flushNotebook() {
+  for (const id of Object.keys(NB.timers)) {
+    clearTimeout(NB.timers[id]);
+    const entry = NB.entries.find(x => x.article.id === id);
+    const box = document.querySelector(`.nb-entry[data-id="${CSS.escape(id)}"]`);
+    if (entry && box) saveEntry(entry, box);
+  }
+}
+window.addEventListener('beforeunload', flushNotebook);
+
+async function openDiscover() {
+  closeReader();
+  drawer(false);
+  S.mode = 'discover'; S.search = null; S.limit = PAGE; $('#search').value = '';
+  $('.view').scrollTop = 0;
+  render();
+  await Promise.all([loadSuggest(), loadRecs()]);
+  if (S.mode === 'discover') render(); else renderTree();
+}
+
+async function loadSuggest() {
+  try { S.suggest = await api('/api/discover'); } catch (err) { S.suggest = { items: [], error: err.message }; }
+}
+
+// Recommendations are filtered by label and access on the server so the ranking fills the page.
+async function loadRecs() {
+  const q = new URLSearchParams({ labels: S.labels.join(','), access: S.access, limit: 300 });
+  try { S.rec = await api(`/api/recommend?${q}`); } catch (err) { S.rec = { items: [], labels: [], error: err.message }; }
+}
+
+async function refreshRecs() {
+  S.rec = null; S.limit = PAGE; renderHead(); renderList();
+  await loadRecs();
+  if (S.mode === 'discover') { renderHead(); renderList(); }
+}
+
+const discoverSource = () => S.sort === 'foryou' ? S.rec : S.suggest;
+
+function suggestScope() {
+  const f = S.suggestTopic || '';
+  return (discoverSource()?.items || []).filter(it => !f || it.topic === f);
+}
+
+function renderDiscoverHead() {
+  const scope = suggestScope();
+  const access = [['all', 'All', scope.length], ['free', 'Free', scope.filter(a => a.locked === false).length],
+    ['locked', '🔒 Member-only', scope.filter(a => a.locked === true).length]];
+  const topics = S.topics.filter(t => (discoverSource()?.items || []).some(it => it.topic === t.id));
+  const forYou = S.sort === 'foryou';
+  $('#viewHead').innerHTML = `
+    <div class="crumb"><span>Discover</span><span>${forYou ? 'picked for you' : 'trending on Medium'}</span></div>
+    <div class="view-title"><h1>Discover</h1></div>
+    <p class="lede">${forYou
+      ? (S.rec?.cold
+        ? `Built from the topics you set up so far${S.rec.engaged ? ` and ${S.rec.engaged} article${S.rec.engaged === 1 ? '' : 's'} you've kept` : ''}. Read, highlight and save, and this page follows you.`
+        : `Ranked by the labels, words and authors of the ${S.rec?.engaged ?? ''} articles you've read. Highlights and notes count most, older reading fades${S.rec?.sources?.index ? `, and ${S.rec.sources.index} picks come straight from your search index` : ''}.`)
+      : "Popular recent posts that fit your topics and aren't in your library yet."} Nothing downloads until you open one.</p>
+    <div class="tabs discover-bar">
+      <span class="sortby">${[['foryou', 'For you'], ['trending', 'Trending']].map(([k, l]) =>
+        `<button class="chip ${S.sort === k ? 'active' : ''}" data-sort="${k}">${l}</button>`).join('')}</span>
+      <select id="suggestTopic" class="input" aria-label="Topic">
+        <option value="">All topics</option>
+        ${topics.map(t => `<option value="${esc(t.id)}" ${S.suggestTopic === t.id ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}
+      </select>
+      <span class="access">${access.map(([k, label, n]) =>
+        `<button class="chip ${S.access === k ? 'active' : ''}" data-access="${k}">${label} <span>${n}</span></button>`).join('')}</span>
+    </div>`;
+  if (forYou) $('#viewHead').insertAdjacentHTML('beforeend', labelBar());
+  $('#suggestTopic').onchange = e => { S.suggestTopic = e.target.value; S.limit = PAGE; renderHead(); renderList(); };
+  $('#viewHead').querySelectorAll('[data-access]').forEach(b => b.onclick = () => {
+    S.access = b.dataset.access; S.limit = PAGE; local.set('access', S.access);
+    if (S.sort === 'foryou') return refreshRecs();
+    renderHead(); renderList();
+  });
+  $('#viewHead').querySelectorAll('[data-sort]').forEach(b => b.onclick = () => {
+    S.sort = b.dataset.sort; S.limit = PAGE; local.set('discoverSort', S.sort);
+    renderHead(); renderList();
+  });
+  if (forYou) bindLabelBar();
+}
+
+// Label filter: chips for chosen labels, an input with suggestions, and one-click picks from your taste.
+function labelBar() {
+  const picks = (S.rec?.top_labels || []).filter(l => !S.labels.includes(l)).slice(0, 8);
+  return `<div class="labelbar">
+    ${S.labels.map(l => `<button class="chip active" data-unlabel="${esc(l)}" title="Remove">#${esc(l)} ✕</button>`).join('')}
+    <input id="labelInput" class="input" list="labelList" placeholder="Filter by label, e.g. rust" aria-label="Add a label">
+    <datalist id="labelList">${(S.rec?.labels || []).map(l => `<option value="${esc(l)}">`).join('')}</datalist>
+    ${picks.length ? `<span class="label-picks">Your labels: ${picks.map(l =>
+      `<button class="chip" data-label="${esc(l)}">#${esc(l)}</button>`).join('')}</span>` : ''}
+  </div>`;
+}
+
+function bindLabelBar() {
+  const set = labels => { S.labels = [...new Set(labels)]; local.set('labels', S.labels); refreshRecs(); };
+  $('#viewHead').querySelectorAll('[data-unlabel]').forEach(b => b.onclick = () => set(S.labels.filter(l => l !== b.dataset.unlabel)));
+  $('#viewHead').querySelectorAll('[data-label]').forEach(b => b.onclick = () => set([...S.labels, b.dataset.label]));
+  $('#labelInput').onkeydown = e => {
+    const v = e.target.value.trim().toLowerCase().replace(/^#/, '').replace(/\s+/g, '-');
+    if (e.key === 'Enter' && v) set([...S.labels, v]);
+  };
+}
+
+function renderDiscoverAll() {
+  const src = discoverSource();
+  if (!src) { $('#list').innerHTML = skeleton(5); return; }
+  if (src.error) { $('#list').innerHTML = `<div class="warn">${esc(src.error)}</div>`; return; }
+  const saved = new Set(S.articles.map(a => a.url));
+  const items = suggestScope().filter(it => S.access === 'all' || (S.access === 'locked' ? it.locked === true : it.locked === false));
+  if (!items.length) {
+    $('#list').innerHTML = `<div class="empty"><b>Nothing new to suggest</b>${src.items.length || S.labels.length
+      ? 'Try another topic, label or filter.' : 'Suggestions appear as the curator reads posts in the background.'}</div>`;
+    return;
+  }
+  const shown = items.slice(0, S.limit), left = items.length - shown.length;
+  $('#list').innerHTML = shown.map(it => {
+    const img = safeUrl(it.image), t = topic(it.topic), s = sub(it.topic, it.subtopic);
+    return `<article class="card ${img ? '' : 'noimg'}" data-suggest="${src.items.indexOf(it)}" tabindex="0">
+    <div>
+      <div class="card-meta">
+        <span>${esc(it.author || sourceOf(it.url))}</span>
+        ${it.published ? `<span class="dot"> ${fmtDate(it.published)}</span>` : ''}
+        ${it.claps ? `<span class="dot" title="${it.claps.toLocaleString()} claps"> 👏 ${fmtCount(it.claps)}</span>` : ''}
+        ${it.reading_time ? `<span class="dot"> ${it.reading_time} min read</span>` : ''}
+      </div>
+      <h2 class="card-title">${esc(it.title)}</h2>
+      ${it.snippet ? `<p class="card-snip">${esc(it.snippet)}</p>` : ''}
+      ${becauseLine(it, s)}
+      <div class="card-foot">
+        ${saved.has(it.url)
+          ? '<button class="btn small primary" data-act="read">Open</button><span class="pill ready">In library</span>'
+          : '<button class="btn small primary" data-act="read">Read</button><button class="btn small" data-act="save">Save for later</button>'}
+        ${S.sort === 'foryou' ? '<button class="btn small" data-act="dismiss" title="Stop suggesting this, and posts like it">Not for me</button>' : ''}
+        ${it.locked === true ? '<span class="pill locked">🔒 Member-only</span>' : it.locked === false ? '<span class="pill free">Free</span>' : ''}
+        ${it.explore ? '<span class="pill loc" title="In a topic you read, outside your usual labels">New to you</span>' : ''}
+        ${s ? `<span class="pill loc" title="Where it will be saved">${esc(t.name)} / ${esc(s.name)}</span>` : ''}
+      </div>
+    </div>
+    ${img ? `<img class="card-img" src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
+  </article>`;
+  }).join('') + (left > 0 ? `<div class="more"><button class="btn" id="showMore">Show ${Math.min(PAGE, left)} more · ${left.toLocaleString()} left</button></div>` : '');
+  $('#showMore') && ($('#showMore').onclick = () => { S.limit += PAGE; renderList(); });
+}
+
+// Why a post is on the page: the labels it shares with your reading, an article of yours that
+// earned that label, or - for a pick from a corner of your topics you've never read - so say.
+function becauseLine(it, s) {
+  if (it.explore) return `<p class="because">${s ? `In ${esc(s.name)}` : 'In a topic you read'}, but not the labels you usually read</p>`;
+  const short = t => (t.length > 56 ? t.slice(0, 55).trimEnd() + '…' : t);
+  const bits = [];
+  if (it.because?.length) bits.push(it.because.map(l => '#' + esc(l)).join(', '));
+  else if (it.because_words?.length) bits.push('about ' + it.because_words.map(esc).join(', '));
+  if (it.like) bits.push(`“${esc(short(it.like))}”`);
+  let line = bits.length ? `Because you read ${bits.join(' — ')}` : '';
+  if (it.same_author) line += line ? ` · more from ${esc(it.author)}` : `More from ${esc(it.author)}, who you read`;
+  return line ? `<p class="because">${line}</p>` : '';
+}
+
+async function dismissSuggestion(card, it) {
+  const send = undo => api('/api/recommend/dismiss', { method: 'POST', body: { url: it.url, undo } });
+  try { await send(false); } catch (err) { return toast(err.message); }
+  card.remove();
+  if (S.rec) S.rec.items = S.rec.items.filter(x => x.url !== it.url);
+  toast('Won’t suggest this again', 6000, {
+    label: 'Undo',
+    run: async () => { try { await send(true); await refreshRecs(); } catch (err) { toast(err.message); } },
+  });
+}
+
+async function onSuggestClick(card, act) {
+  const it = discoverSource()?.items[+card.dataset.suggest];
+  if (!it) return;
+  if (act === 'dismiss') return dismissSuggestion(card, it);
+  const a = await saveArticle({
+    url: it.url, title: it.title, snippet: it.snippet, author: it.author, image: it.image,
+    published: it.published, claps: it.claps, topic: it.topic, subtopic: it.subtopic,
+  });
+  if (!a) return;
+  renderTree();
+  if (act === 'save') {
+    toast(`Saved to ${sub(a.topic, a.subtopic)?.name || 'library'}`);
+    const pill = Object.assign(document.createElement('span'), { className: 'pill ready', textContent: 'In library' });
+    card.querySelector('[data-act="save"]')?.replaceWith(pill);
+    return;
+  }
+  openReader(a);
+}
+
 /* ------------------------------------------------------------ search all of Medium */
 // Results are links only. Nothing is downloaded until the user opens one.
 const looksLikeUrl = s => /^https?:\/\/\S+$/i.test(s) || /^([\w-]+\.)*medium\.com\/\S+$/i.test(s);
@@ -375,13 +746,16 @@ async function runSearch(q) {
   S.mode = 'search';
   const s = S.search = { q, dest: S.search?.dest || currentDest(), items: [], next: null, loading: true, error: null };
   renderTree(); renderHead(); renderList();
+  $('#searchForm').classList.add('busy');
   try {
     const r = await api(`/api/search?q=${encodeURIComponent(q)}`);
-    s.items = r.items; s.next = r.next; s.provider = r.provider; s.notice = r.notice;
+    s.items = r.items; s.next = r.next; s.provider = r.provider; s.notice = r.notice; s.parsed = r.parsed;
     if (r.index) { S.index = r.index; renderIndex(); }
   } catch (err) { s.error = err.message; }
   s.loading = false;
-  if (S.search === s) renderList();
+  // The head is drawn before the request so the page reacts at once, and again after it, because
+  // only the answer knows how the query was read ("since:60d" -> a date).
+  if (S.search === s) { renderHead(); renderList(); $('#searchForm').classList.remove('busy'); }
 }
 
 async function loadMore() {
@@ -401,6 +775,7 @@ async function loadMore() {
 function exitSearch() {
   if (S.mode !== 'search') return;
   S.mode = 'browse'; S.search = null;
+  $('#searchForm').classList.remove('busy');
   closeReader(); render();
 }
 
@@ -408,9 +783,10 @@ function renderSearchHead() {
   const s = S.search;
   $('#viewHead').innerHTML = `
     <div class="crumb"><span>Search</span><span>all of Medium</span></div>
-    <div class="view-title"><h1>“${esc(s.q)}”</h1></div>
+    <div class="view-title"><h1>${s.q.includes('"') ? esc(s.q) : `“${esc(s.q)}”`}</h1></div>
+    ${s.parsed ? `<p class="lede">Reading that as: ${esc(s.parsed)}.</p>` : ''}
     <div class="search-line">
-      <span class="crumb">Nothing downloads until you open an article.</span>
+      <span class="crumb">Nothing downloads until you open an article. Try <code>"exact words"</code>, <code>-without</code>, <code>author:name</code>, <code>since:30d</code>.</span>
       <label class="dest">Save to <select id="searchDest" class="input">${destOptions(s.dest)}</select></label>
       <button class="linkish" id="exitSearch">← back to library</button>
     </div>`;
@@ -432,18 +808,26 @@ function renderSearch() {
     const img = safeUrl(it.image);
     return `<article class="card ${img ? '' : 'noimg'}" data-result="${i}" tabindex="0">
     <div>
-      <div class="card-meta"><span>${esc(it.author || sourceOf(it.url))}</span>${it.published ? `<span class="dot"> ${fmtDate(it.published)}</span>` : ''}</div>
+      <div class="card-meta">
+        <span>${esc(it.author || sourceOf(it.url))}</span>
+        ${it.published ? `<span class="dot"> ${fmtDate(it.published)}</span>` : ''}
+        ${it.claps ? `<span class="dot" title="${it.claps.toLocaleString()} claps"> 👏 ${fmtCount(it.claps)}</span>` : ''}
+        ${it.reading_time ? `<span class="dot"> ${it.reading_time} min read</span>` : ''}
+      </div>
       <h2 class="card-title">${esc(it.title)}</h2>
       ${it.snippet ? `<p class="card-snip">${esc(it.snippet)}</p>` : ''}
+      ${it.missing?.length ? `<p class="because">Doesn't mention ${it.missing.map(w => `<b>${esc(w)}</b>`).join(', ')}</p>` : ''}
       <div class="card-foot">${saved.has(it.url)
         ? '<button class="btn small primary" data-act="read">Open</button><span class="pill ready">In library</span>'
-        : '<button class="btn small primary" data-act="read">Read as PDF</button><button class="btn small" data-act="save">Save link</button>'}
+        : '<button class="btn small primary" data-act="read">Read</button><button class="btn small" data-act="save">Save for later</button>'}
+        ${it.locked === true ? '<span class="pill locked">🔒 Member-only</span>' : it.locked === false ? '<span class="pill free">Free</span>' : ''}
+        ${it.yours ? '<span class="pill loc" title="Close to what you read">Your kind of thing</span>' : ''}
       </div>
     </div>
     ${img ? `<img class="card-img" src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
   </article>`;
   }).join('');
-  if (s.loading) h += '<div class="loading">Searching Medium…</div>';
+  if (s.loading) h += s.items.length ? '<div class="loading">Loading more…</div>' : skeleton(5);
   else if (!s.items.length && !s.error) h += '<div class="empty"><b>No Medium articles found</b>Try different or fewer words.</div>';
   else if (s.next) h += '<div class="more"><button class="btn" id="loadMore">Load more results</button></div>';
   $('#list').innerHTML = h;
@@ -471,12 +855,22 @@ async function refreshIndex() {
   const v = S.index.library_version;
   if (S.libVersion === undefined) { S.libVersion = v; return; }
   // the curator (or another tab) changed the library: reload at most every 20s, never under an open article
-  if (v !== S.libVersion && !$('#dlg').open && !S.reader && Date.now() - (S.lastLoad || 0) > 20000) {
+  if (v !== S.libVersion && !$('#dlg').open && !S.reader && !S.pendingRemovals.size && Date.now() - (S.lastLoad || 0) > 20000) {
     S.libVersion = v;
     S.lastLoad = Date.now();
-    const scroll = $('.view').scrollTop;
-    await load();
-    $('.view').scrollTop = scroll;
+    const onScreen = () => (S.mode === 'browse' && S.tab === 'library'
+      ? visibleArticles().slice(0, S.limit).map(a => `${a.id}${a.pdf_url}${a.locked}${a.claps}`).join() : null);
+    const before = onScreen();
+    const data = await api('/api/library').catch(() => null);
+    if (!data) return;
+    S.topics = data.topics; S.articles = data.articles;
+    renderTree();
+    // the curator adds articles in the background; don't make the list jump under the reader's eyes
+    if (before !== onScreen()) {
+      const scroll = $('.view').scrollTop;
+      renderHead(); renderList();
+      $('.view').scrollTop = scroll;
+    }
   }
 }
 
@@ -490,7 +884,9 @@ function renderIndex() {
     : st.error ? ['warn', 'waiting to retry']
     : ['ok', st.days_indexed ? 'index up to date' : 'starting…'];
   const curSub = cur.current && sub(...cur.current.split('/'));
+  const g = cur.goal;
   const curLine = !cur.enabled ? 'auto-add is off'
+    : g ? `bulk add · ${fmtCount(g.added_free)}/${fmtCount(g.free)} free · ${fmtCount(g.added_locked)}/${fmtCount(g.locked)} member-only`
     : curSub ? `finding trending ${curSub.name} posts…`
     : `${fmtCount(st.articles || 0)} articles · ${fmtCount(cur.member_only || 0)} member-only` +
       (cur.backfill_left ? ` · checking ${fmtCount(cur.backfill_left)}` : '');
@@ -519,6 +915,15 @@ async function indexSettings() {
       <p class="hint" style="margin:0">Paywall status: ${(st.curator?.free || 0).toLocaleString()} free ·
         ${(st.curator?.member_only || 0).toLocaleString()} member-only${st.curator?.backfill_left ? ` · ${st.curator.backfill_left.toLocaleString()} still being checked` : ''}.</p>
       <label class="check"><input type="checkbox" name="curator" ${st.curator?.enabled ? 'checked' : ''}> Keep adding trending articles automatically</label>
+      <fieldset class="bulk">
+        <legend>Bulk add</legend>
+        ${st.curator?.goal ? `<p class="hint" style="margin:0">Running: ${st.curator.goal.added_free.toLocaleString()} of ${st.curator.goal.free.toLocaleString()} free and
+          ${st.curator.goal.added_locked.toLocaleString()} of ${st.curator.goal.locked.toLocaleString()} member-only added so far.</p>
+          <label class="check"><input type="checkbox" name="goalCancel"> Stop the bulk add</label>`
+        : `<div class="bulk-row"><label>Free<input class="input" type="number" name="goalFree" min="0" max="5000" value="0"></label>
+          <label>Member-only<input class="input" type="number" name="goalLocked" min="0" max="5000" value="0"></label></div>
+          <p class="hint" style="margin:0">Adds this many links on top of the usual targets, spread across every topic. Needs auto-add turned on.</p>`}
+      </fieldset>
       <p class="hint">The curator visits one subtopic at a time, reads a few new posts, and adds the member-only ones trending by claps. Free stories are skipped, and free ones already saved are dropped unless you added or downloaded them.
         Each topic aims for at least 1,120; once a subtopic has its share, better posts replace the weakest ones you haven't downloaded. It has added
         ${(st.curator?.added_total || 0).toLocaleString()} and swapped ${(st.curator?.rotated_total || 0).toLocaleString()} so far.
@@ -528,7 +933,11 @@ async function indexSettings() {
   });
   if (!v) return;
   try {
-    S.index = await api('/api/index', { method: 'POST', body: { days: +v.days, paused: v.paused === 'on', curator_enabled: v.curator === 'on' } });
+    const body = { days: +v.days, paused: v.paused === 'on', curator_enabled: v.curator === 'on' };
+    if (v.goalCancel === 'on') Object.assign(body, { goal_free: 0, goal_locked: 0 });
+    else if (+v.goalFree > 0 || +v.goalLocked > 0) Object.assign(body, { goal_free: +v.goalFree || 0, goal_locked: +v.goalLocked || 0 });
+    S.index = await api('/api/index', { method: 'POST', body });
+    if (body.goal_free) toast(`Bulk add started: ${body.goal_free} free + ${body.goal_locked} member-only`);
     renderIndex();
   } catch (err) { toast(err.message); }
 }
@@ -556,6 +965,8 @@ const setProgress = pct => { const bar = $('#readProgress'); if (bar) bar.style.
 function openReader(a, force = false) {
   saveNotes(); closePop(); hideSelTools();
   S.reader = a;
+  if (!force) window.BabelIntro?.play(a, readerState(a), { topicName: [topic(a.topic)?.name, sub(a.topic, a.subtopic)?.name].filter(Boolean).join(' · ') });
+  if (!force) api(`/api/articles/${a.id}/read`, { method: 'POST' }).catch(() => {});
   $('#reader').hidden = false;
   $('#readerOriginal').href = safeUrl(a.url);
   $('#readerRefetch').onclick = () => openReader(S.reader, true);
@@ -568,6 +979,14 @@ function openReader(a, force = false) {
   const upgrading = !force && !!a.pdf_url;
   startFetch(a, force || upgrading, upgrading ? 'Upgrading an older download to the new reader' : '');
 }
+
+// what the Library of Babel intro (babel.js) watches while it plays over the reader
+const readerState = a => () => {
+  if (S.reader?.id !== a.id) return { state: 'gone' };
+  if (R.article?.id === a.id) return { state: 'ready', doc: $('#doc') };
+  if ($('#readerBody .fetch-card[data-state="error"], #docScroll .empty')) return { state: 'error' };
+  return { state: 'loading', text: $('#readerBody .fetch-title')?.textContent || '' };
+};
 
 function updateReaderBar(a) {
   const s = sub(a.topic, a.subtopic);
@@ -585,15 +1004,30 @@ const STEP_TEXT = {
 };
 const STEP_PCT = { queued: 6, check: 18, medium: 42, freedium: 42, images: 64, pdf: 84, done: 100 };
 
+function elapsedNote(job) {
+  const s = job?.started ? Math.max(0, Math.round(Date.now() / 1000 - job.started)) : 0;
+  if (s < 6) return '';
+  return job.route === 'freedium' && s > 15 ? `${s}s · the free mirror can be slow; this may take up to a minute` : `${s}s`;
+}
+
 function renderPipeline(stage, job, error, note = '') {
   const a = S.reader;
   const line = job?.route === 'freedium'
     ? `Member-only story · via Freedium${job.reason && job.reason !== 'member-only story' ? ` (${job.reason})` : ''}`
     : job?.route === 'medium' ? 'Free story · straight from Medium' : note;
-  $('#readerBody').innerHTML = `<div class="fetching"><div class="fetch-card">
+  const card = $('#readerBody .fetch-card[data-state="running"]');
+  if (card && !error) {  // update in place while polling so the bar glides instead of being rebuilt
+    card.querySelector('.fetch-title').textContent = `${STEP_TEXT[stage] || 'Working'}…`;
+    card.querySelector('.fetch-bar span').style.width = `${STEP_PCT[stage] ?? 10}%`;
+    card.querySelector('.fetch-line').textContent = line || '';
+    card.querySelector('.fetch-time').textContent = elapsedNote(job);
+    return;
+  }
+  $('#readerBody').innerHTML = `<div class="fetching"><div class="fetch-card" data-state="${error ? 'error' : 'running'}">
     <div class="fetch-title">${error ? "Couldn't download this article" : `${esc(STEP_TEXT[stage] || 'Working')}…`}</div>
     ${error ? `<div class="err">${esc(error)}</div>` : `<div class="fetch-bar"><span style="width:${STEP_PCT[stage] ?? 10}%"></span></div>`}
-    ${line ? `<div class="fetch-sub">${esc(line)}</div>` : ''}
+    <div class="fetch-sub fetch-line">${esc(line || '')}</div>
+    ${error ? '' : `<div class="fetch-sub fetch-time">${esc(elapsedNote(job))}</div>`}
     ${error ? `<div class="fetch-actions">
       <button class="btn small primary" id="retry">Try again</button>
       ${a?.pdf_url ? `<a class="btn small ghost" href="${esc(pdfHref(a.pdf_url))}" target="_blank" rel="noopener">Open the old PDF</a>` : ''}
@@ -639,11 +1073,13 @@ function finish(a) {
 
 function closeReader() {
   clearTimeout(S.pollTimer);
-  saveNotes(); closePop(); hideSelTools();
+  const saving = saveNotes(); closePop(); hideSelTools();
+  const wasOpen = !!S.reader;
   R.article = null;
   S.reader = null;
   $('#reader').hidden = true;
   $('#readerBody').innerHTML = '';
+  if (wasOpen && S.mode === 'notebook') saving.then(loadNotebook);  // pick up edits made in the reader
 }
 $('#readerClose').onclick = () => { closeReader(); render(); refreshIndex(); };
 $('#readerNotes').onclick = () => toggleNotes();
@@ -690,7 +1126,7 @@ Take deep detailed, organized notes for studying, now yet to the straight point,
 * Write the notes in a proper diction that is clear, concise, straight to the point, but also informative and strong`;
 const CHATGPT_URL_LIMIT = 8000;  // longer prompts are copied to the clipboard instead of sent in the link
 
-const R = { article: null, notes: { notes: '', highlights: [] }, dirty: false, saveTimer: null, selTimer: null };
+const R = { article: null, notes: { notes: '', summary: '', highlights: [] }, dirty: false, saveTimer: null, selTimer: null };
 const docRoot = () => (R.article ? $('#doc') : null);
 
 async function showDoc(a) {
@@ -705,7 +1141,7 @@ async function showDoc(a) {
   try {
     [content, notes] = await Promise.all([
       fetch(a.doc_url).then(r => { if (!r.ok) throw new Error(r.statusText); return r.text(); }),
-      api(`/api/articles/${a.id}/notes`).catch(() => ({ notes: '', highlights: [] })),
+      api(`/api/articles/${a.id}/notes`).catch(() => ({ notes: '', summary: '', highlights: [] })),
     ]);
   } catch (err) {
     $('#docScroll').innerHTML = `<div class="empty"><b>Couldn't open the saved copy</b>${esc(err.message)}</div>`;
@@ -724,7 +1160,7 @@ async function showDoc(a) {
   doc.querySelectorAll('a[href]').forEach(link => { link.target = '_blank'; link.rel = 'noopener noreferrer'; });
   ArticleDoc.render(doc);
   R.article = a;
-  R.notes = { notes: notes.notes || '', highlights: Array.isArray(notes.highlights) ? notes.highlights : [] };
+  R.notes = { notes: notes.notes || '', summary: notes.summary || '', highlights: Array.isArray(notes.highlights) ? notes.highlights : [] };
   R.dirty = false;
   applyAllHighlights();
   buildNotesPanel();
@@ -877,6 +1313,26 @@ document.addEventListener('keydown', e => {
   else if (k === 's') { e.preventDefault(); summarize(s.text); }
 });
 
+/* offline key points: score sentences by how many of the article's frequent words they use */
+const STOP = new Set(('a an the and or but if of to in on for with at by from as is are was were be been being it its this that these those '
+  + 'i you he she we they them his her our your their my me us not no so than then there here what which who whom how why when where '
+  + 'can could will would should may might must do does did done have has had just also more most very into about over such only '
+  + 'one two all any some each other out up down new like get use using used make way').split(' '));
+function keyPoints(text, max = 7) {
+  const sentences = text.replace(/\s+/g, ' ').match(/[^.!?]+[.!?]+/g)?.map(x => x.trim())
+    .filter(x => x.length > 50 && x.length < 400 && !/[{};=]{2}/.test(x)) || [];
+  if (sentences.length < 3) return [];
+  const words = x => (x.toLowerCase().match(/[a-z][a-z'-]{2,}/g) || []).filter(w => !STOP.has(w));
+  const freq = {};
+  for (const x of sentences) for (const w of new Set(words(x))) freq[w] = (freq[w] || 0) + 1;
+  const n = Math.min(max, Math.max(3, Math.round(sentences.length / 12)));
+  return sentences.map((x, i) => {
+    const ws = words(x);
+    const score = ws.reduce((t, w) => t + (freq[w] > 1 ? Math.log(1 + freq[w]) : 0), 0) / Math.sqrt(ws.length + 1);
+    return { x, i, score: score * (i < 3 ? 1.2 : 1) };  // openings tend to state the point
+  }).sort((p, q) => q.score - p.score).slice(0, n).sort((p, q) => p.i - q.i).map(p => p.x);
+}
+
 /* summarize in ChatGPT */
 const summaryPrompt = () => local.get('summaryPrompt', null) || SUMMARY_PROMPT;
 
@@ -975,6 +1431,12 @@ function buildNotesPanel() {
       <button class="btn small ghost" id="closeNotes" title="Hide notes">×</button>
     </div>
     <div class="notes-scroll">
+      <div class="notes-label">Summary
+        <span class="sum-actions">
+          <button class="btn small ghost" id="draftSummary" title="Pick the article's key sentences, offline">Draft key points</button>
+          <button class="btn small ghost" id="gptSummary" title="Summarize the whole article in ChatGPT">✦ ChatGPT</button>
+        </span></div>
+      <textarea id="sumNotes" class="input notes-free notes-sum" placeholder="Draft key points, or paste ChatGPT's summary here. Saved with the article."></textarea>
       <label class="notes-label">Your notes<textarea id="freeNotes" class="input notes-free" placeholder="Anything worth remembering about this article…"></textarea></label>
       <div class="notes-label">Highlights <span id="hlCount"></span></div>
       <div id="hlList" class="hl-list"></div>
@@ -983,6 +1445,20 @@ function buildNotesPanel() {
     </div>`;
   $('#freeNotes').value = R.notes.notes || '';
   $('#freeNotes').oninput = e => { R.notes.notes = e.target.value; queueSave(); };
+  $('#sumNotes').value = R.notes.summary || '';
+  $('#sumNotes').oninput = e => { R.notes.summary = e.target.value; queueSave(); };
+  $('#draftSummary').onclick = () => {
+    const doc = docRoot();
+    if (!doc) return;
+    const points = keyPoints(doc.innerText);
+    if (!points.length) return toast('Not enough text to summarize');
+    const draft = points.map(p => `• ${p}`).join('\n');
+    const box = $('#sumNotes');
+    box.value = box.value.trim() ? `${box.value.trim()}\n\n${draft}` : draft;
+    R.notes.summary = box.value; queueSave();
+    toast(`Drafted ${points.length} key points`);
+  };
+  $('#gptSummary').onclick = () => { const doc = docRoot(); if (doc) summarize(doc.innerText); };
   $('#closeNotes').onclick = () => toggleNotes(false);
   $('#copyNotes').onclick = copyNotesMarkdown;
   $('#editPrompt').onclick = editSummaryPrompt;
@@ -1019,7 +1495,8 @@ function copyNotesMarkdown() {
   if (!a) return;
   const items = [...R.notes.highlights].filter(h => !h._orphan).sort((x, y) => x.start - y.start);
   const md = [`# ${a.title}`, a.url, '',
-    ...(R.notes.notes?.trim() ? [R.notes.notes.trim(), ''] : []),
+    ...(R.notes.summary?.trim() ? ['## Summary', R.notes.summary.trim(), ''] : []),
+    ...(R.notes.notes?.trim() ? ['## Notes', R.notes.notes.trim(), ''] : []),
     ...items.flatMap(h => [`> ${h.quote.replace(/\s*\n+\s*/g, ' ')}`, ...(h.note?.trim() ? ['', h.note.trim()] : []), ''])].join('\n');
   navigator.clipboard.writeText(md).then(() => toast('Notes copied as Markdown'), () => toast('Could not copy'));
 }
@@ -1055,7 +1532,7 @@ async function saveNotes() {
   const a = R.article;
   if (!a || !R.dirty) return;
   R.dirty = false;
-  const body = { notes: R.notes.notes || '', highlights: R.notes.highlights.map(({ _orphan, ...h }) => h) };
+  const body = { notes: R.notes.notes || '', summary: R.notes.summary || '', highlights: R.notes.highlights.map(({ _orphan, ...h }) => h) };
   try {
     const r = await api(`/api/articles/${a.id}/notes`, { method: 'PUT', body });
     a.notes_count = r.notes_count;
@@ -1079,7 +1556,16 @@ function dialog({ title, body, submit = 'Save', danger = false }) {
     form.innerHTML = `<h3>${esc(title)}</h3>${body}
       <div class="row"><button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
       <button class="btn ${danger ? 'danger' : 'primary'}" value="ok">${esc(submit)}</button></div>`;
-    dlg.onclose = () => resolve(dlg.returnValue === 'ok' ? Object.fromEntries(new FormData(form)) : null);
+    // Read the answer when the form is submitted, not on the dialog's close event: some browsers
+    // deliver "close" late (or not at all while the window isn't painting), which silently lost Save.
+    let done = false;
+    const finish = value => { if (!done) { done = true; resolve(value); } };
+    form.onsubmit = e => {
+      const ok = e.submitter?.value === 'ok';
+      finish(ok ? Object.fromEntries(new FormData(form)) : null);
+    };
+    dlg.onclose = () => finish(dlg.returnValue === 'ok' ? Object.fromEntries(new FormData(form)) : null);
+    dlg.oncancel = () => finish(null);
     dlg.returnValue = '';
     dlg.showModal();
     form.querySelector('input, select')?.focus();
@@ -1148,17 +1634,49 @@ async function moveArticle(a) {
 }
 
 async function removeArticle(a) {
-  const ok = await dialog({
-    title: 'Remove article?',
-    body: `<p style="margin:0;color:var(--muted)">“${esc(a.title)}” is removed from your library${a.pdf_url ? ', and its saved copy is deleted' : ''}${a.notes_count ? ' along with your highlights and notes' : ''}.</p>`,
-    submit: 'Remove', danger: true,
+  if (a.pdf_url || a.doc_url || a.notes_count) {
+    const ok = await dialog({
+      title: 'Remove article?',
+      body: `<p style="margin:0;color:var(--muted)">“${esc(a.title)}” is removed from your library${a.pdf_url ? ', and its saved copy is deleted' : ''}${a.notes_count ? ' along with your highlights and notes' : ''}.</p>`,
+      submit: 'Remove', danger: true,
+    });
+    if (ok) deleteNow(a);
+    return;
+  }
+  const index = S.articles.indexOf(a);
+  const drop = () => { S.articles = S.articles.filter(x => x !== a); renderTree(); renderHead(); renderList(); };
+  const card = $(`#list .card[data-id="${CSS.escape(a.id)}"]`);
+  if (card) { card.classList.add('leaving'); setTimeout(drop, 180); } else drop();
+  const timer = setTimeout(() => { S.pendingRemovals.delete(a.id); deleteNow(a); }, 5000);
+  S.pendingRemovals.set(a.id, timer);
+  toast('Removed from library', 5000, {
+    label: 'Undo',
+    run: () => {
+      clearTimeout(timer);
+      S.pendingRemovals.delete(a.id);
+      setTimeout(() => {
+        if (!S.articles.includes(a)) S.articles.splice(Math.min(index, S.articles.length), 0, a);
+        render();
+      }, 200);
+    },
   });
-  if (!ok) return;
+}
+
+async function deleteNow(a) {
   try {
     await api(`/api/articles/${a.id}`, { method: 'DELETE' });
     S.articles = S.articles.filter(x => x.id !== a.id);
     render();
-  } catch (err) { toast(err.message); }
+  } catch (err) {
+    if (!S.articles.includes(a)) { S.articles.unshift(a); render(); }
+    toast(err.message, 4000);
+  }
 }
+window.addEventListener('pagehide', () => {  // finish removals that were still waiting for Undo
+  for (const [id, timer] of S.pendingRemovals) {
+    clearTimeout(timer);
+    fetch(`/api/articles/${id}`, { method: 'DELETE', keepalive: true });
+  }
+});
 
 load().catch(err => { $('#list').innerHTML = `<div class="empty"><b>Can't reach the server</b>${esc(err.message)}</div>`; });

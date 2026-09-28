@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from urllib.parse import unquote, urlsplit
 
 import polite
+import relevance
 
 SITEMAP_INDEX = "https://medium.com/sitemap/sitemap.xml"
 REQUEST_GAP = 1.5          # seconds between sitemap downloads
@@ -27,7 +28,13 @@ INDEX_REFRESH = 6 * 3600   # re-read the list of sitemaps this often
 RECHECK_DAYS = 3           # the newest days are re-crawled when Medium updates them
 MIN_FREE_GB = 2            # stop growing the index when its drive gets this full
 MIN_WORDS = 2              # one-word slugs are mostly short replies ("trust", "thanks")
-PRIORITY_WEIGHT = 3.0      # sitemap <priority> (0.1-1.0) nudges ranking toward posts Medium rates higher
+
+# Searching: SQLite picks a wide band of candidates, relevance.py re-scores it (see search()).
+TITLE_WEIGHT = 10.0        # bm25 column weights: the slug title carries the meaning...
+AUTHOR_WEIGHT = 2.0        # ...the author name is a weaker signal unless asked for by name
+RERANK_WINDOW = 400        # candidates re-scored beyond the requested page
+MAX_CANDIDATES = 1200      # ...and never more than this, so deep paging stays fast
+AUTHOR_CAP = 2             # posts per author before the rest move down the page
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, day TEXT, prio REAL);
@@ -213,18 +220,70 @@ class MediumIndex:
                 "free_gb": round(shutil.disk_usage(os.path.dirname(self.path)).free / 1e9, 1)}
 
     # ------------------------------------------------------------ search
-    def search(self, q, limit=20, offset=0):
-        """Every word must match (stemmed). Falls back to any word when nothing matches all of them."""
-        terms = re.findall(r"\w+", q.lower())
-        if not terms:
-            return [], "all"
-        sql = ("SELECT posts.url, posts.day FROM posts_fts JOIN posts ON posts.id = posts_fts.rowid "
-               f"WHERE posts_fts MATCH ? ORDER BY posts_fts.rank - posts.prio * {PRIORITY_WEIGHT} LIMIT ? OFFSET ?")
-        quoted = [f'"{t}"' for t in terms]
+    def _match(self, expr, query, limit):
+        """Candidate rows for one FTS expression, cheapest-first by bm25 with the title weighted up."""
+        sql = ["SELECT p.url, p.day, p.prio, bm25(posts_fts, ?, ?) AS bm "
+               "FROM posts_fts JOIN posts p ON p.id = posts_fts.rowid WHERE posts_fts MATCH ?"]
+        params = [TITLE_WEIGHT, AUTHOR_WEIGHT, expr]
+        if query.since:
+            sql.append("AND p.day >= ?")
+            params.append(query.since)
+        if query.before:
+            sql.append("AND p.day <= ?")
+            params.append(query.before)
+        sql.append("ORDER BY bm LIMIT ?")
+        params.append(limit)
         with self._db() as c:
-            rows = c.execute(sql, (" AND ".join(quoted), limit, offset)).fetchall()
-            mode = "all"
-            if not rows and offset == 0 and len(terms) > 1:
-                rows = c.execute(sql, (" OR ".join(quoted), limit, offset)).fetchall()
-                mode = "any"
-        return [{"url": u, "title": slug_title(u), "author": author_of(u), "published": d} for u, d in rows], mode
+            try:
+                rows = c.execute(" ".join(sql), params).fetchall()
+            except sqlite3.OperationalError:
+                return []  # a MATCH expression FTS5 won't parse: treat as no results, not a crash
+        return [{"url": u, "title": slug_title(u), "author": author_of(u),
+                 "published": day, "prio": prio, "bm": bm} for u, day, prio, bm in rows]
+
+    def search(self, q, limit=20, offset=0, mode=None, taste=None, cap=AUTHOR_CAP):
+        """Search the index. Returns {items, mode, more, parsed, scanned}.
+
+        Retrieval and ranking are separate jobs. SQLite finds a wide band of candidates by bm25 -
+        which costs about the same for 20 rows as for 500, because the sort dominates - and
+        relevance.py then re-scores that band on how much of the query each title really contains,
+        whether the words sit together, how fresh the post is and how Medium rates it.
+
+        When a query is too strict to fill a page the net widens in steps, and because reranking
+        puts full matches above partial ones, a widened search can only add results below the ones
+        it already had. Paging re-ranks the same widened band and slices it, so page 2 continues
+        page 1 instead of restarting.
+
+        mode forces one step instead of widening ("any" is how recommendations ask for posts
+        matching any of a subtopic's phrases). taste is an optional word -> weight map of what the
+        reader is interested in, which nudges genuinely ambiguous queries their way.
+        """
+        query = relevance.parse_query(q)
+        if query.empty:
+            return {"items": [], "mode": "all", "more": False, "parsed": "", "scanned": 0}
+
+        # The window grows in whole steps rather than with the offset, so consecutive pages rank
+        # the same band of candidates and page 2 carries on where page 1 stopped.
+        steps = -(-(offset + limit + 1) // RERANK_WINDOW)
+        want = min(steps * RERANK_WINDOW, MAX_CANDIDATES)
+        multi = len(query.terms) + len(query.phrases) > 1
+        rows, used = [], mode or "all"
+        for step in (mode,) if mode else ("all", "prefix", "any"):
+            if not mode and step == "prefix" and not query.terms:
+                continue
+            if not mode and step == "any" and not multi:
+                break
+            expr = relevance.fts_expression(query, step)
+            if not expr:
+                break
+            found = self._match(expr, query, want)
+            if len(found) >= len(rows):
+                rows, used = found, step
+            if len(rows) > offset + limit:
+                break  # enough to fill this page and know there is another
+
+        ranked = relevance.rank(query, rows, taste=taste)
+        ranked = relevance.diversify(ranked, group=lambda r: r["author"], cap=cap)
+        page = ranked[offset:offset + limit]
+        return {"items": page, "mode": used, "more": len(ranked) > offset + limit,
+                "parsed": query.describe(), "scanned": len(rows)}

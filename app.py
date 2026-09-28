@@ -28,6 +28,7 @@ import polite
 from curator import Curator
 from medium_index import MediumIndex
 from pipeline import PdfPipeline, PipelineError
+from recommender import Recommender
 from topics import default_topics
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -238,6 +239,8 @@ class Store:
 store = Store(DB_PATH)
 pipeline = PdfPipeline(STATIC_DIR)
 jobs: dict[str, dict] = {}
+_tasks: set[asyncio.Task] = set()  # the event loop only keeps weak references to running tasks
+JOB_TTL = 3600                     # finished jobs the UI may still poll for
 feed_cache: dict[str, tuple[float, list]] = {}
 
 
@@ -373,12 +376,12 @@ STOPWORDS = {"a", "an", "and", "the", "of", "for", "to", "in", "on", "with", "ho
 medium_index = MediumIndex(os.path.join(DATA_DIR, "search-index", "medium.db"), default_days=90)  # ~4 MB per day
 
 
-def search_feeds(q):
+def search_feeds(q, max_tags=6):
     words = [w for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in STOPWORDS]
     if not words:
         return []
     # candidate tags: the whole phrase, adjacent pairs, then single words
-    tags = list(dict.fromkeys(["-".join(words)] + ["-".join(words[i:i + 2]) for i in range(len(words) - 1)] + words))[:6]
+    tags = list(dict.fromkeys(["-".join(words)] + ["-".join(words[i:i + 2]) for i in range(len(words) - 1)] + words))[:max_tags]
     pool = {}
     for tag in tags:  # polite.py spaces out the requests
         try:
@@ -395,26 +398,57 @@ def search_feeds(q):
     return [it for it in ranked if score(it)]
 
 
+def enrich(item):
+    """Fill a search hit out with real metadata when the curator has already read that post.
+
+    The index only knows what a URL reveals - a title made from the slug, and the day it was
+    published. For the few thousand posts the curator has opened we know the real title, the
+    subtitle, the image, the clap count and whether it is member-only, which turns a bare link
+    into the same card the rest of the app shows.
+    """
+    m = curator.cache.get(item["url"])
+    if not m or not m.get("title"):
+        return item
+    return dict(item, title=m["title"], snippet=m.get("snippet") or "", image=m.get("image"),
+                author=m.get("author") or item.get("author") or "", claps=m.get("claps"),
+                reading_time=m.get("reading_time"), locked=m.get("locked"),
+                published=m.get("published") or item.get("published"))
+
+
 def web_search(q, offset=0):
     """Returns {items, next, provider, notice, index}: one page from the local index,
     topped up with live tag-feed matches on the first page while the index is thin."""
-    found, mode = medium_index.search(q, PAGE_SIZE, offset)
-    items, provider = list(found), "index"
-    if offset == 0 and len(found) < PAGE_SIZE:
+    try:
+        taste = recommender.word_profile()
+    except Exception:
+        taste = None  # search is the app's backbone; it works with or without knowing the reader
+    res = medium_index.search(q, PAGE_SIZE, offset, taste=taste)
+    found = res["items"]
+    items, provider = [enrich(it) for it in found], "index"
+    st = medium_index.status()
+    # Each live tag feed is a rate-limited request to Medium (seconds, not milliseconds), so only
+    # reach for them while the index is young or when it has nothing at all for this query.
+    young = st["days_indexed"] < min(30, st["days_setting"])
+    if offset == 0 and (not found or (young and len(found) < PAGE_SIZE)):
         seen = {i["url"] for i in found}
-        extra = [it for it in search_feeds(q) if it["url"] not in seen][:PAGE_SIZE]
+        extra = [it for it in search_feeds(q, 6 if young else 3) if it["url"] not in seen][:PAGE_SIZE]
         items += extra
         if extra and not found:
             provider = "feeds"
-    st = medium_index.status()
     notice = None
-    if st["days_indexed"] < min(30, st["days_setting"]):
+    if young:
         notice = (f"Your Medium search index is still being built: {st['posts']:,} articles from "
                   f"{st['days_indexed']} days so far. Results improve as it keeps crawling in the background.")
-    elif mode == "any" and found:
-        notice = "No indexed title contains all of your words, so these match some of them."
-    nxt = {"offset": offset + PAGE_SIZE} if len(found) == PAGE_SIZE else None
-    return {"items": items, "next": nxt, "provider": provider, "notice": notice, "index": st}
+    elif res["mode"] != "all" and found:
+        # The net was widened, but say so only when this page really does show a partial match:
+        # widening often still fills the page with titles that have every word.
+        missing = sorted({w for it in found for w in it.get("missing") or []})
+        if missing:
+            notice = ("Not enough titles contain all of your words, so the results lower down are "
+                      f"missing some of them ({', '.join(missing[:4])}).")
+    nxt = {"offset": offset + PAGE_SIZE} if res["more"] else None
+    return {"items": items, "next": nxt, "provider": provider, "notice": notice, "index": st,
+            "parsed": res["parsed"]}
 
 
 # ---------------------------------------------------------------- app
@@ -450,6 +484,7 @@ class ArticleIn(BaseModel):
     published: str | None = None
     claps: int | None = None
     source: str | None = None  # "auto" when the curator added it
+    locked: bool | None = None  # True = member-only, when the caller already checked
 
 
 class MoveIn(BaseModel):
@@ -459,8 +494,10 @@ class MoveIn(BaseModel):
 
 @app.get("/api/library")
 def get_library():
-    with store.lock:  # the curator adds and removes articles from its own thread
-        return {"topics": store.data["topics"], "articles": [public(a) for a in store.data["articles"]]}
+    with store.lock:  # the curator threads edit article dicts; copy a consistent snapshot
+        topics = json.loads(json.dumps(store.data["topics"]))
+        articles = [dict(a) for a in store.data["articles"]]
+    return {"topics": topics, "articles": [public(a) for a in articles], "version": store.version}
 
 
 @app.post("/api/topics")
@@ -546,6 +583,50 @@ async def discover(tid: str, sid: str):
     return {"tags": sub["tags"], "items": items, "errors": errors}
 
 
+@app.get("/api/discover")
+async def discover_all():
+    """Trending posts across every topic that aren't saved yet (from the curator's page cache; no network)."""
+    items = await asyncio.to_thread(curator.suggestions)
+    return {"items": [dict(it, id=article_id(it["url"])) for it in items]}
+
+
+@app.get("/api/recommend")
+async def recommend(labels: str = "", access: str = "all", limit: int = 60):
+    """Posts picked for you from what you've read. labels: comma-separated Medium tags to narrow to."""
+    include_locked = {"free": False, "locked": True}.get(access)
+    res = await asyncio.to_thread(recommender.recommend, labels.split(","), max(1, min(limit, 300)), include_locked)
+    res["items"] = [dict(it, id=article_id(it["url"])) for it in res["items"]]
+    res["labels"] = await asyncio.to_thread(recommender.all_labels)
+    return res
+
+
+class DismissIn(BaseModel):
+    url: str
+    undo: bool = False
+
+
+@app.post("/api/recommend/dismiss")
+async def dismiss(body: DismissIn):
+    """'Not for me': the post stops being suggested, and posts like it rank lower."""
+    url = normalize_url(body.url.strip())
+    if not url:
+        raise HTTPException(400, "Which post?")
+    await asyncio.to_thread(recommender.dismiss, url, body.undo)
+    return {"ok": True, "dismissed": not body.undo}
+
+
+@app.post("/api/articles/{aid}/read")
+def mark_read(aid: str):
+    """The reader opened this article; recommendations learn from it."""
+    a = store.article(aid)
+    if not a:
+        raise HTTPException(404, "Article not found.")
+    with store.lock:
+        a["read_at"] = now_iso()
+        store.save()
+    return {"ok": True}
+
+
 @app.get("/api/search")
 async def search_medium(q: str = "", next: str | None = None):
     """Search all of Medium. Returns links only; nothing is downloaded until an article is opened."""
@@ -561,13 +642,16 @@ async def search_medium(q: str = "", next: str | None = None):
     res = await asyncio.to_thread(web_search, q, offset)
     items = [dict(it, id=article_id(it["url"]), saved=store.by_url(it["url"]) is not None) for it in res["items"]]
     return {"q": q, "items": items, "next": json.dumps(res["next"]) if res["next"] else None,
-            "provider": res["provider"], "notice": res["notice"], "index": res["index"]}
+            "provider": res["provider"], "notice": res["notice"], "index": res["index"],
+            "parsed": res["parsed"]}
 
 
 class IndexSettings(BaseModel):
     days: int | None = None
     paused: bool | None = None
     curator_enabled: bool | None = None
+    goal_free: int | None = None    # bulk fill: extra free articles to add (0 with goal_locked=0 cancels)
+    goal_locked: int | None = None  # bulk fill: extra member-only articles to add
 
 
 def full_status():
@@ -588,6 +672,8 @@ def index_settings(body: IndexSettings):
         medium_index.set_paused(body.paused)
     if body.curator_enabled is not None:
         curator.set_enabled(body.curator_enabled)
+    if body.goal_free is not None or body.goal_locked is not None:
+        curator.set_goal(body.goal_free or 0, body.goal_locked or 0)
     return full_status()
 
 
@@ -614,15 +700,23 @@ def create_article(fields):
     return a
 
 
+def downloading(aid):
+    return any(j["article_id"] == aid and j["status"] == "running" for j in jobs.values())
+
+
 def remove_article(a):
+    """Drop an article and its files. Returns False while it is downloading or already removed."""
+    if downloading(a["id"]):
+        return False
     if not store.discard(a):
-        return
+        return False
     if a.get("doc"):
         shutil.rmtree(abs_path(posixpath.dirname(a["doc"])), ignore_errors=True)
     elif a.get("pdf") and os.path.exists(abs_path(a["pdf"])):
         os.remove(abs_path(a["pdf"]))
     if os.path.exists(notes_path(a["id"])):
         os.remove(notes_path(a["id"]))
+    return True
 
 
 @app.post("/api/articles")
@@ -639,6 +733,8 @@ def move_article(aid: str, body: MoveIn):
         raise HTTPException(404, "Article not found.")
     if not store.subtopic(body.topic, body.subtopic):
         raise HTTPException(404, "Subtopic not found.")
+    if downloading(aid):
+        raise HTTPException(409, "This article is downloading right now. Move it when it finishes.")
     with store.lock:
         old_pdf, old_doc = a.get("pdf"), a.get("doc")
         a["topic"], a["subtopic"] = body.topic, body.subtopic
@@ -662,11 +758,9 @@ def delete_article(aid: str):
     a = store.article(aid)
     if not a:
         raise HTTPException(404, "Article not found.")
-    remove_article(a)
+    if not remove_article(a):
+        raise HTTPException(409, "This article is downloading right now. Try again when it finishes.")
     return {"ok": True}
-
-
-JOB_TTL = 3600  # finished jobs the UI may still poll for
 
 
 def prune_jobs():
@@ -740,25 +834,58 @@ async def fetch_article(aid: str, force: bool = False):
     prune_jobs()
     jobs[job["id"]] = job
     with store.lock:
-        a["fetching"] = True  # the curator leaves this one alone until the download settles
-    asyncio.create_task(run_job(job, a))
+        a["fetching"] = True
+    task = asyncio.create_task(run_job(job, a))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
     return job
 
 
 class NotesIn(BaseModel):
     notes: str = ""
+    summary: str = ""  # whole-article summary (drafted in the app or pasted from ChatGPT)
     highlights: list[dict] = []
+
+
+def notes_count(data):
+    return len(data.get("highlights") or []) + sum(1 for k in ("notes", "summary") if (data.get(k) or "").strip())
+
+
+def read_notes(aid):
+    path = notes_path(aid)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return {"notes": data.get("notes") or "", "summary": data.get("summary") or "",
+                "highlights": data.get("highlights") or []}
+    return {"notes": "", "summary": "", "highlights": []}
 
 
 @app.get("/api/articles/{aid}/notes")
 def get_notes(aid: str):
     if not store.article(aid):
         raise HTTPException(404, "Article not found.")
-    path = notes_path(aid)
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return {"notes": "", "highlights": []}
+    return read_notes(aid)
+
+
+@app.get("/api/notebook")
+def notebook():
+    """Every article with a summary, notes or highlights, most recently edited first."""
+    with store.lock:
+        articles = {a["id"]: a for a in store.data["articles"]}
+    entries = []
+    if os.path.isdir(NOTES_DIR):
+        for name in os.listdir(NOTES_DIR):
+            aid = name[:-5]
+            if not name.endswith(".json") or aid not in articles:
+                continue
+            data = read_notes(aid)
+            if not notes_count(data):
+                continue
+            edited = datetime.fromtimestamp(os.path.getmtime(notes_path(aid)), timezone.utc).isoformat(timespec="seconds")
+            entries.append({"article": public(articles[aid]), "edited": edited, **data})
+    entries.sort(key=lambda e: e["edited"], reverse=True)
+    return {"entries": entries}
 
 
 @app.put("/api/articles/{aid}/notes")
@@ -775,7 +902,7 @@ def put_notes(aid: str, body: NotesIn):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(raw)
     os.replace(tmp, notes_path(aid))
-    count = len(data["highlights"]) + (1 if data["notes"].strip() else 0)
+    count = notes_count(data)
     with store.lock:
         if a.get("notes_count", 0) != count:
             a["notes_count"] = count
@@ -792,6 +919,25 @@ def get_job(jid: str):
 
 
 curator = Curator(medium_index, store, create_article, remove_article)
+recommender = Recommender(store, curator.cache, notes_path, medium_index)
+
+@app.middleware("http")
+async def cache_headers(request, call_next):
+    """Let the browser keep what rarely changes. Stamped /static URLs (?v=mtime) and vendor libraries are
+    cached for a year; article images for a day. Everything else under /files and /static revalidates
+    (cheap 304s via ETag/Last-Modified), so re-downloaded articles show up immediately."""
+    response = await call_next(request)
+    path = request.url.path
+    if response.status_code != 200 or "cache-control" in response.headers:
+        return response
+    if path.startswith("/static/") and ("v" in request.query_params or path.startswith("/static/vendor/")):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path.startswith("/files/") and "/images/" in path:
+        response.headers["Cache-Control"] = "public, max-age=86400"
+    elif path.startswith(("/files/", "/static/")):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 
 app.mount("/files", StaticFiles(directory=LIBRARY_DIR), name="files")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

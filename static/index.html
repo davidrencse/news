@@ -32,6 +32,7 @@
       <span class="logo">M</span>
       <div><b>Medium Library</b><small>curated · offline · PDF</small></div>
       <button id="themeBtn" class="btn ghost icon theme-btn" title="Toggle light/dark mode" aria-label="Toggle light/dark mode">◐</button>
+      <button id="babelBtn" class="btn ghost icon babel-btn" aria-label="Library of Babel intro" aria-pressed="false" hidden>⬡</button>
     </div>
     <nav id="tree" class="tree" aria-label="Topics"></nav>
     <div class="side-foot">
@@ -44,7 +45,7 @@
     <header class="topbar">
       <button id="menuBtn" class="btn ghost icon menu-btn" aria-label="Topics" aria-expanded="false" aria-controls="sidebar">☰</button>
       <form id="searchForm" class="searchform" role="search">
-        <input id="search" class="input search" type="search" placeholder="Search all of Medium…  (Enter)" autocomplete="off" aria-label="Search all of Medium">
+        <input id="search" class="input search" type="search" placeholder="Search all of Medium   ( / )" autocomplete="off" aria-label="Search all of Medium">
       </form>
       <button id="pasteBtn" class="btn ghost icon paste-btn" aria-label="Paste a Medium link" aria-expanded="false" aria-controls="pasteForm">＋</button>
       <form id="pasteForm" class="paste">
@@ -97,5 +98,6 @@
 <script src="/static/vendor/hljs/highlight.min.js"></script>
 <script src="/static/article.js"></script>
 <script src="/static/app.js"></script>
+<script type="module" src="/static/babel.js"></script>
 </body>
 </html>

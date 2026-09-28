@@ -233,12 +233,14 @@ def test_index():
     urls = [f"https://medium.com/@a/indexed-post-about-malware-{i:012x}" for i in range(30)]
     kept = idx.crawl_day("2026-09-10", "https://medium.com/sitemap/posts/2026/posts-2026-09-10.xml")
     check("crawl_day needs its page stubbed", False) if kept is None else None
-    rows, mode = idx.search("malware", limit=50)
+    result = idx.search("malware", limit=50, mode="all")
+    rows, mode = result["items"], result["mode"]
     check("indexed posts are searchable", len(rows) == 30 and mode == "all", f"{len(rows)} {mode}")
     check("titles come from the slug", rows[0]["title"].startswith("Indexed post about malware"), rows[0]["title"])
-    rows, mode = idx.search("malware unrelatedword")
+    result = idx.search("malware unrelatedword")
+    rows, mode = result["items"], result["mode"]
     check("falls back to matching any word", mode == "any" and rows, f"{mode} {len(rows)}")
-    rows, _ = idx.search("")
+    rows = idx.search("")["items"]
     check("an empty query returns nothing", rows == [])
 
 
@@ -365,6 +367,26 @@ def test_member_only_library():
     for a in [keep_mine, keep_read, unchecked] + added:
         if A.store.by_url(a["url"]):
             A.store.discard(A.store.by_url(a["url"]))
+
+
+def test_explicit_bulk_goal():
+    """An explicit mixed bulk request survives the default member-only collection policy."""
+    cur = A.curator
+    sub = {"id": "malware", "name": "Malware", "tags": ["malware"]}
+    before = {a["url"] for a in A.store.data["articles"]}
+    cur.set_goal(1, 1)
+    added_count, rotated, _ = cur.curate("cybersecurity", sub, cap=100, filling=True)
+    batch = [a for a in A.store.data["articles"] if a["url"] not in before]
+    check("bulk adds exactly the requested count without rotating", added_count == 2 and rotated == 0)
+    check("bulk fulfills both requested membership types",
+          len(batch) == 2 and sum(a.get("locked") is True for a in batch) == 1
+          and sum(a.get("locked") is False for a in batch) == 1)
+    check("a completed bulk goal clears itself", cur.goal() is None)
+    cur.purge_free()
+    check("explicitly requested free links survive automatic cleanup",
+          all(A.store.by_url(a["url"]) is a for a in batch))
+    for a in batch:
+        A.store.discard(a)
 
 
 def test_candidate_scan_deepens():
