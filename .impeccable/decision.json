@@ -1,0 +1,111 @@
+{
+  "title": "Choose the visual direction",
+  "question": "The roll assigned the Annotated Galley. Which visual direction best supports calm reading across articles, research, and CVEs?",
+  "options": [
+    {
+      "id": "assigned",
+      "label": "Annotated Galley",
+      "kicker": "THE ROLL",
+      "lineage": "Newspaper proof sheets and reader marks",
+      "thesis": "Read deeply without losing your bearings: annotate a document, then return to its source and shelf.",
+      "palette": ["#f3efe4", "#202624", "#ad3c2f", "#647c70"],
+      "materials": ["warm proof stock", "printer's rules", "red pencil marks"],
+      "viewport": "The reader leads: an open proof sheet with a generous text measure, discreet controls, and a genuine margin for notes and highlights. A narrow topic rail and top source line preserve bearings across articles and CVEs; return to the library for the saved register and discovery tools.",
+      "risk": "Editorial styling can feel like a publication unless saved state, source identity, and personal annotations stay in view.",
+      "raised": [
+        {"from": "Botanical Folio", "raise": "Repeated landmarks keep article and CVE changes comparable across updates."},
+        {"from": "Ikeda Data Field", "raise": "Dense records use strict columns and high contrast; density never becomes texture."}
+      ],
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "topic rail", "x": 0, "y": 0, "w": 2, "h": 10}, {"label": "reader header and source", "x": 2, "y": 0, "w": 10, "h": 1}, {"label": "article proof", "x": 3, "y": 2, "w": 6, "h": 8, "accent": true}, {"label": "notes margin", "x": 9, "y": 2, "w": 3, "h": 8}]}
+    },
+    {
+      "id": "model-pick",
+      "label": "Researcher’s Lab Notebook",
+      "kicker": "IMPECCABLE’S PICK",
+      "lineage": "Field notebooks and laboratory record books",
+      "thesis": "One durable record for every source, with its provenance and the reader’s thinking kept together.",
+      "palette": ["#eee9dc", "#202824", "#526f60", "#b24a38"],
+      "materials": ["ruled paper", "ink annotations", "numbered entries"],
+      "viewport": "A reader’s notebook opens directly to the selected article, with provenance and dated annotations beside the text. A compact index returns to all saved sources.",
+      "risk": "Notebook language is familiar for research tools; careful typography and a strong article register must keep the library distinctive.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "topic tabs", "x": 0, "y": 0, "w": 2, "h": 10}, {"label": "source and reading record", "x": 2, "y": 1, "w": 3, "h": 9}, {"label": "article text", "x": 5, "y": 1, "w": 5, "h": 9, "accent": true}, {"label": "reader notes", "x": 10, "y": 1, "w": 2, "h": 9}]}
+    },
+    {
+      "id": "challenger-timetable",
+      "label": "Pocket Timetable Rack",
+      "verdict": "competitive",
+      "lineage": "1970s airline timetable tables",
+      "thesis": "A compact, column-led register makes a large library quick to scan.",
+      "palette": ["#d9aa3b", "#202321", "#f2efe6", "#9d382b"],
+      "materials": ["printed columns", "fixed data cells", "position ticks"],
+      "viewport": "A continuous article register with stable columns, a visible position rail, and each topic retaining its own heading as the reader moves.",
+      "case": "Strong scan clarity; less recognizable as a comfortable home for long-form reading and personal notes.",
+      "risk": "Rigid columns can squeeze titles and prose on narrow screens.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "topic rail", "x": 0, "y": 0, "w": 2, "h": 10}, {"label": "fixed-column source register", "x": 2, "y": 1, "w": 10, "h": 9, "accent": true}]}
+    },
+    {
+      "id": "challenger-wayfinding",
+      "label": "Research Wayfinding",
+      "verdict": "competitive",
+      "lineage": "Airport decision-point signage",
+      "thesis": "Topic paths and source states stay visible at every turn.",
+      "palette": ["#f2d21c", "#171b19", "#f5f1e7"],
+      "materials": ["sign bands", "directional arrows", "decision points"],
+      "viewport": "A short sequence of topic and source waypoints leads from the broad library into a saved article or CVE record.",
+      "case": "Excellent wayfinding; a route metaphor is weaker for browsing a collection and settling into a long read.",
+      "risk": "Too much signage would turn a quiet personal tool into a loud transit hall.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "topic path", "x": 0, "y": 0, "w": 3, "h": 10, "accent": true}, {"label": "current source waypoint", "x": 3, "y": 1, "w": 7, "h": 2}, {"label": "document", "x": 3, "y": 3, "w": 7, "h": 7}]}
+    },
+    {
+      "id": "challenger-boarding",
+      "label": "Change-Aware Register",
+      "verdict": "competitive",
+      "lineage": "Boarding passes and live departure boards",
+      "thesis": "When a record changes, its row moves in place and stays marked until noticed.",
+      "palette": ["#f2efe7", "#202321", "#bf4935"],
+      "materials": ["segmented records", "tabular figures", "persistent change marks"],
+      "viewport": "Saved items form a fixed-column board; alerts remain on the changed record, while source details stay in a segmented metadata line.",
+      "case": "Useful product clarity for updates and CVEs; less identification with a personal reading library.",
+      "risk": "A live-board idiom can make reading feel urgent when it should feel settled.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "source status board", "x": 0, "y": 0, "w": 12, "h": 3, "accent": true}, {"label": "document", "x": 1, "y": 3, "w": 7, "h": 7}, {"label": "change notes", "x": 8, "y": 3, "w": 4, "h": 7}]}
+    },
+    {
+      "id": "challenger-folio",
+      "label": "Botanical Comparison Folio",
+      "verdict": "declined",
+      "lineage": "Registered botanical plates",
+      "thesis": "Keep a stable landmark when records change over time.",
+      "palette": ["#eee8d9", "#29332d", "#71826a", "#a03c30"],
+      "materials": ["fixed-scale plates", "shared baselines", "comparison marks"],
+      "viewport": "A stable source landmark beside revision and publication dates makes update history easier to compare.",
+      "case": "Kept: stable landmarks make time-based comparison legible across article and vulnerability records.",
+      "risk": "A plant lifecycle is too specific to carry this mixed-source library.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "stable record landmarks", "x": 0, "y": 0, "w": 3, "h": 10}, {"label": "registered comparison", "x": 3, "y": 1, "w": 8, "h": 8, "accent": true}]}
+    },
+    {
+      "id": "challenger-ikeda",
+      "label": "High-Contrast Data Field",
+      "verdict": "declined",
+      "lineage": "Dense data-art installations",
+      "thesis": "Make a dense index read as deliberate structure at a glance.",
+      "palette": ["#ffffff", "#111111"],
+      "materials": ["barcode columns", "tabular figures", "hairline rules"],
+      "viewport": "Use a disciplined grid for compact CVE and source metadata, with the article title and reading action remaining primary.",
+      "case": "Kept: density belongs in column rules and tabular figures, never decorative noise.",
+      "risk": "Pure data density weakens the calm reading task and source distinctions.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "tabular source index", "x": 0, "y": 0, "w": 12, "h": 4, "accent": true}, {"label": "reader with fixed text measure", "x": 2, "y": 4, "w": 8, "h": 6}]}
+    }
+  ],
+  "reroll": {"registers": ["safer", "bolder"]},
+  "buildPath": {"value": "code", "toggle": false},
+  "canon": true,
+  "canonCard": {
+    "label": "The category standard",
+    "thesis": "A clean, expected library dashboard, executed with care.",
+    "palette": ["#ffffff", "#111827", "#2563eb"],
+    "materials": ["quiet panels", "familiar navigation", "article thumbnails"],
+    "viewport": "A conventional sidebar and searchable article list, with saved and discovery views in familiar tabs.",
+    "risk": "Easy to understand, but indistinguishable from other reading dashboards by design."
+  },
+  "steer": true
+}

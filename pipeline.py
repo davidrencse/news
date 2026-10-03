@@ -185,8 +185,8 @@ class PdfPipeline:
         await self._ensure_browser()
         async with self._sem:
             ctx = await self._browser.new_context(viewport={"width": PAGE_WIDTH_PX, "height": 1123}, color_scheme="light")
-            page = await ctx.new_page()
             try:
+                page = await ctx.new_page()
                 # Free stories come straight from Medium; only paywalled or refused ones go through Freedium.
                 on_stage("check")
                 try:

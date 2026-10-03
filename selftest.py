@@ -244,6 +244,65 @@ def test_index():
     check("an empty query returns nothing", rows == [])
 
 
+def test_performance_guardrails():
+    """Pin bounded search work and recommendation reuse without machine-specific timings."""
+    import types
+    from recommender import Recommender
+
+    # Deep paging must not make SQLite return/rerank an unbounded candidate set.
+    idx = A.medium_index
+    requested = []
+    real_match = idx._match
+
+    def counted_match(expr, query, limit):
+        requested.append(limit)
+        return real_match(expr, query, limit)
+
+    idx._match = counted_match
+    try:
+        idx.search("malware", limit=20, offset=100_000)
+    finally:
+        idx._match = real_match
+    from medium_index import MAX_CANDIDATES
+    check("deep search paging keeps each candidate query within the configured cap",
+          bool(requested) and max(requested) <= MAX_CANDIDATES, requested)
+
+    # A repeat recommendation request with the same library/cache version must reuse its ranking.
+    rec = object.__new__(Recommender)
+    rec.store = types.SimpleNamespace(version=7)
+    rec.cache = {}
+    rec._memo = {}
+    calls = []
+    rec._rank = lambda want, limit, access: calls.append((want, limit, access)) or {"items": []}
+    first = rec.recommend(["malware"], 30)
+    second = rec.recommend(["malware"], 30)
+    check("repeat recommendation loads reuse the cached ranking", first is second and len(calls) == 1,
+          len(calls))
+    rec.store.version += 1
+    rec.recommend(["malware"], 30)
+    check("a library change invalidates recommendation reuse", len(calls) == 2, len(calls))
+
+    # Paged browsing should reuse its precomputed scope/count index between page requests.
+    probe = A.create_article({"url": "https://medium.com/@a/page-index-probe-7f7f7f7f7f7f",
+                              "topic": "cybersecurity", "subtopic": "malware", "title": "Page index probe"})
+    probe2 = A.create_article({"url": "https://medium.com/@a/page-index-probe-8f8f8f8f8f8f",
+                               "topic": "cybersecurity", "subtopic": "malware", "title": "Page index probe two"})
+    probe["notes_count"] = 1
+    A.store.save()
+    first_page = A.get_library_page(0, 1)
+    index_ref = A._library_page_cache
+    second_page = A.get_library_page(1, 1)
+    expected_noted = sum(bool(a.get("notes_count")) for a in A.store.data["articles"])
+    check("paged library requests reuse the versioned index", A._library_page_cache is index_ref)
+    check("library page counts report each noted article once",
+          first_page["counts"]["noted"] == expected_noted, (first_page["counts"]["noted"], expected_noted))
+    check("paged library results advance without rescanning into duplicate rows",
+          first_page["articles"][0]["id"] != second_page["articles"][0]["id"],
+          [x["id"] for x in first_page["articles"] + second_page["articles"]])
+    A.store.discard(probe)
+    A.store.discard(probe2)
+
+
 def test_render():
     url = "https://medium.com/@a/free-story-abcdef123456"
     PAGES[url] = post_page("abcdef123456", "Free story", tags=("cybersecurity", "malware"))
@@ -613,10 +672,15 @@ def test_web_app_surface():
     check("the manifest has both icon sizes",
           {i["sizes"] for i in man["icons"]} >= {"192x192", "512x512"}, man["icons"])
     check("a maskable icon is offered", any("maskable" in i.get("purpose", "") for i in man["icons"]))
-    for icon in {i["src"] for i in man["icons"]} | {"/static/apple-touch-icon.png"}:
+    for icon in {i["src"] for i in man["icons"] if i.get("type") == "image/png"} | {"/static/apple-touch-icon.png"}:
         got = client.get(icon)
         check(f"{icon} exists and is a PNG",
               got.status_code == 200 and got.content[:8] == b"\x89PNG\r\n\x1a\n", got.status_code)
+    svg_icon = next(i["src"] for i in man["icons"] if i.get("type") == "image/svg+xml")
+    svg = client.get(svg_icon)
+    check("the scalable app icon is served as SVG",
+          svg.status_code == 200 and "svg" in svg.headers.get("content-type", "") and b"<svg" in svg.content[:500],
+          (svg.status_code, svg.headers.get("content-type")))
 
     r = client.get("/sw.js")
     check("the service worker is served from the root", r.status_code == 200, r.status_code)
@@ -635,6 +699,9 @@ def test_web_app_surface():
     js = open(os.path.join(A.STATIC_DIR, "app.js"), encoding="utf-8").read()
     check("the drawer is wired up", "#menuBtn" in js and "drawer(" in js)
     check("the service worker is registered", "serviceWorker" in js and "/sw.js" in js)
+    babel = open(os.path.join(A.STATIC_DIR, "babel.js"), encoding="utf-8").read()
+    check("Babel idle work falls back to a numeric timer on Safari",
+          "setTimeout(callback, timeout)" in babel and "(window.requestIdleCallback || setTimeout)" not in babel)
 
 
 def test_phone_ui():
@@ -648,12 +715,13 @@ def test_phone_ui():
     import uvicorn
     from playwright.async_api import async_playwright
 
-    for i in range(4):  # a few cards so the list has something to lay out
-        A.create_article({"url": f"https://medium.com/@a/phone-ui-article-number-{i}-{i:012x}",
+    phone_articles = []
+    for i in range(70):  # exercise the first page and incremental append path
+        phone_articles.append(A.create_article({"url": f"https://medium.com/@a/phone-ui-article-number-{i}-{i:012x}",
                           "topic": "cybersecurity", "subtopic": "malware", "source": "auto",
                           "title": f"Phone ui article number {i} with a fairly long title that wraps",
                           "author": "Jane Researcher", "claps": 1200 + i,
-                          "snippet": "A standfirst long enough to wrap across more than one line on a phone."})
+                          "snippet": "A standfirst long enough to wrap across more than one line on a phone."}))
     port = __import__("socket").socket()
     port.bind(("127.0.0.1", 0))
     port = port.getsockname()[1]
@@ -672,10 +740,29 @@ def test_phone_ui():
         ctx = await browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True,
                                         has_touch=True, device_scale_factor=2)
         page = await ctx.new_page()
+        await page.add_init_script("localStorage.setItem('babelIntro', 'false')")
+        requests = []
+        page.on("request", lambda request: requests.append(request.url))
         try:
+            started = time.perf_counter()
             await page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
             await page.wait_for_selector(".card", timeout=15000)
             out = {}
+            out["first_render_seconds"] = time.perf_counter() - started
+            out["cves_deferred"] = not any(url.endswith("/api/cves") for url in requests)
+            first_card = await page.locator(".card").first.evaluate_handle("el => el")
+            out["first_page_count"] = await page.locator(".card").count()
+            out["library_count"] = await page.evaluate("S.articles.length")
+            if await page.locator("#showMore").count():
+                await page.evaluate("document.querySelector('#showMore').click()")
+                await page.wait_for_function("S.articles.length > 60 && !S.libraryLoading", timeout=10000)
+                out["second_page_count"] = await page.locator(".card").count()
+                out["limit_after_more"] = await page.evaluate("S.limit")
+                out["pagination_keeps_existing_cards"] = await first_card.evaluate(
+                    "el => el.isConnected")
+            else:
+                out["second_page_count"] = out["first_page_count"]
+                out["pagination_keeps_existing_cards"] = False
 
             out["no_sideways_scroll"] = await page.evaluate(
                 "document.documentElement.scrollWidth <= window.innerWidth + 1")
@@ -745,6 +832,14 @@ def test_phone_ui():
         server.should_exit = True
 
     check("the page never scrolls sideways", r["no_sideways_scroll"])
+    check("the library's first cards render within the local-load budget",
+          r["first_render_seconds"] < 8.0, f"{r['first_render_seconds']:.2f}s (budget 8s)")
+    check("opening the library defers the saved CVE payload", r["cves_deferred"])
+    check("the first library page stays capped at 60 cards", r["first_page_count"] == 60,
+          r["first_page_count"])
+    check("show more appends the next page without rebuilding earlier cards",
+          r["second_page_count"] > r["first_page_count"] and r["pagination_keeps_existing_cards"],
+          (r["first_page_count"], r["second_page_count"], r["pagination_keeps_existing_cards"]))
     check("the topics button is shown", r["menu_visible"])
     check("the sidebar starts closed", r["sidebar_hidden"])
     check("tapping it opens the drawer", r["drawer_opens"])
@@ -759,6 +854,8 @@ def test_phone_ui():
     check("nothing is painted on top of it", r["back_is_on_top"], r["back_is_on_top"])
     check("tapping it returns to the library", r["reader_closes"])
     check("tap targets are big enough for a thumb", r["tap_targets_big_enough"])
+    for article in phone_articles:
+        A.store.discard(article)
 
     for a in [a for a in A.store.data["articles"] if a["subtopic"] == "malware"]:
         A.store.discard(a)
@@ -834,6 +931,12 @@ def test_offline_reading():
     PAGES[url] = post_page("909090909090", "Read me offline", tags=("cybersecurity", "malware"))
     a = A.create_article({"url": url, "topic": "cybersecurity", "subtopic": "malware",
                           "title": "Read me offline"})
+    # Keep the fixture inside the first paged response even if earlier checks grow the library.
+    with A.store.lock:
+        A.store.data["articles"].remove(a)
+        A.store.data["articles"].insert(0, a)
+        A.store.reindex()
+        A.store.save()
     rel = A.folder_rel(a)
     asyncio.run(A.pipeline.render(url, A.abs_path(rel)))
     with A.store.lock:
@@ -879,6 +982,8 @@ def test_offline_reading():
                    }""")
             out["app_js_cached"] = any("/static/app.js?v=" in u for u in cached)
             out["article_cached"] = any("/content.html" in u for u in cached)
+            out["paged_library_cached"] = any("/api/library/page?" in u for u in cached)
+            out["paged_library_urls"] = [u for u in cached if "/api/library/page" in u]
             out["one_app_js"] = sum("/static/app.js" in u for u in cached) <= 2  # bare + one stamp
 
             # the PDF viewer asks for byte ranges; a 206 is a slice, and caching one corrupts the file
@@ -902,10 +1007,17 @@ def test_offline_reading():
             out["offline_app_loads"] = await page.evaluate("typeof S === 'object' && Array.isArray(S.articles)")
             out["offline_has_articles"] = await page.evaluate("S.articles.length > 0")
             out["offline_renders_cards"] = await page.is_visible(".card")
-            await page.click(".card-title")
-            await page.wait_for_selector("#doc", timeout=20000)
-            out["offline_article_opens"] = await page.is_visible("#doc")
-            out["offline_article_has_text"] = "A heading" in (await page.inner_text("#doc"))
+            out["offline_list_message"] = await page.locator("#list").inner_text()
+            out["offline_cached_page_rows"] = await page.evaluate(
+                "fetch('/api/library/page?offset=0&limit=60&access=all').then(r => r.json()).then(d => d.articles.length).catch(() => -1)")
+            if await page.locator(".card-title").count():
+                await page.click(".card-title")
+                await page.wait_for_selector("#doc", timeout=20000)
+                out["offline_article_opens"] = await page.is_visible("#doc")
+                out["offline_article_has_text"] = "A heading" in (await page.inner_text("#doc"))
+            else:
+                out["offline_article_opens"] = False
+                out["offline_article_has_text"] = False
 
             # app.py stamps assets with the file's mtime, so an update changes every asset URL.
             # Offline, those new URLs are not in the cache and must fall back to the stored version.
@@ -932,11 +1044,13 @@ def test_offline_reading():
     check("the service worker registers", r["registers"])
     check("the stamped app.js is cached, not just the bare URL", r["app_js_cached"], r["app_js_cached"])
     check("the article's saved copy is cached", r["article_cached"])
+    check("the paged library payload is cached for offline startup", r["paged_library_cached"])
     check("old versions of an asset don't pile up", r["one_app_js"])
     check("byte-range replies are never cached", r["no_partials_cached"], r["no_partials_cached"])
     check("the app still loads with no network", r["offline_app_loads"])
-    check("the library list survives offline", r["offline_has_articles"])
-    check("the cards render offline", r["offline_renders_cards"])
+    check("the library list survives offline", r["offline_has_articles"], r.get("offline_list_message"))
+    check("the cards render offline", r["offline_renders_cards"],
+          (r.get("offline_list_message"), r.get("offline_cached_page_rows"), r.get("paged_library_urls")))
     check("a saved article still opens offline", r["offline_article_opens"])
     check("and its text is there", r["offline_article_has_text"])
     check("it still loads offline after an app update changed every asset URL", r["offline_after_update"])

@@ -25,6 +25,10 @@ const S = {
   topics: [],
   limit: PAGE,
   articles: [],
+  libraryCounts: { total: 0, noted: 0, topics: {} },
+  libraryTotal: 0,
+  libraryLoading: true,
+  libraryRequest: 0,
   sel: local.get('sel', { topic: null, sub: null }),
   tab: 'library',
   access: local.get('access', 'all'),  // 'all' | 'free' | 'locked' (member-only)
@@ -38,6 +42,15 @@ const S = {
   sort: local.get('discoverSort', 'foryou'),  // Discover: 'foryou' (recommended) | 'trending'
   labels: local.get('labels', []),            // Discover "For you": only posts with one of these labels
   rec: null,             // {items, labels, top_labels, engaged} from /api/recommend
+  cves: [],
+  cvesLoaded: false,
+  cveCatalog: { count: 0, job: { state: 'idle' } },
+  cveCatalogItems: [],
+  cveCatalogQuery: '',
+  cveCatalogYear: '',
+  cveCatalogOffset: 0,
+  cveCatalogTotal: 0,
+  cveCatalogPoll: null,
 };
 
 // "New" means added by the curator since the previous visit (nothing is new on a first visit).
@@ -47,6 +60,17 @@ local.set('lastVisit', new Date().toISOString().slice(0, 19) + '+00:00');
 const topic = id => S.topics.find(t => t.id === id);
 const sub = (t, s) => topic(t)?.subtopics.find(x => x.id === s);
 const key = (t, s) => `${t}/${s}`;
+const libraryCount = (t = null, s = null, access = 'all') => {
+  const counts = t ? S.libraryCounts.topics?.[t] : S.libraryCounts;
+  const scope = s ? counts?.subtopics?.[s] : counts;
+  return scope?.[access === 'all' ? 'total' : access] || 0;
+};
+function libraryPageUrl(offset = 0, limit = PAGE) {
+  const params = new URLSearchParams({ offset, limit, access: S.access });
+  if (S.sel.topic) params.set('topic_id', S.sel.topic);
+  if (S.sel.sub) params.set('subtopic_id', S.sel.sub);
+  return `/api/library/page?${params}`;
+}
 const fmtDate = d => {
   if (!d) return '';
   const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(d);  // bare dates are local days, not UTC midnight
@@ -67,11 +91,73 @@ function toast(msg, ms = 2600, action = null) {
 }
 
 async function load() {
-  const data = await api('/api/library');
-  S.topics = data.topics; S.articles = data.articles;
+  // Load the saved CVE shelf when Vulnerabilities opens; it can be large and is fetched there too.
+  const selectionBefore = JSON.stringify(S.sel);
+  let data = await api(`/api/library/first?${new URLSearchParams({ limit: PAGE, topic_id: S.sel.topic || '', subtopic_id: S.sel.sub || '', access: S.access })}`);
+  S.topics = data.topics;
   if (S.sel.topic && !topic(S.sel.topic)) S.sel = { topic: null, sub: null };
   if (S.sel.sub && !sub(S.sel.topic, S.sel.sub)) S.sel.sub = null;
+  if (JSON.stringify(S.sel) !== selectionBefore) {
+    data = await api(`/api/library/first?${new URLSearchParams({ limit: PAGE, topic_id: S.sel.topic || '', subtopic_id: S.sel.sub || '', access: S.access })}`);
+  }
+  S.articles = data.articles;
+  S.libraryCounts = { total: 0, noted: 0, topics: {} };
+  S.libraryTotal = 0;
+  S.libVersion = data.version;
+  S.libraryLoading = false;
   render();
+  refreshLibraryMeta();
+}
+
+async function loadLibraryPage(append = false) {
+  if (S.mode !== 'browse' || S.tab !== 'library' || (append && S.libraryLoading)) return;
+  const request = ++S.libraryRequest;
+  const offset = append ? S.articles.length : 0;
+  S.libraryLoading = true;
+  if (append) {
+    const more = $('#showMore');
+    if (more) { more.disabled = true; more.textContent = 'Loading moreâ€¦'; }
+  } else {
+    S.articles = [];
+    renderList();
+  }
+  try {
+    const data = await api(libraryPageUrl(offset));
+    if (request !== S.libraryRequest) return;
+    S.topics = data.topics;
+    S.libraryCounts = data.counts;
+    S.libraryTotal = data.total;
+    S.libVersion = data.version;
+    S.articles = append ? [...S.articles, ...data.articles] : data.articles;
+    S.libraryLoading = false;
+    if (append) {
+      $('#showMore')?.parentElement.remove();
+      $('#list').insertAdjacentHTML('beforeend', data.articles.map(a => libraryCard(a, !S.sel.sub)).join(''));
+      renderMoreButton(S.libraryTotal - S.articles.length);
+    } else {
+      renderTree(); renderHead(); renderList();
+    }
+  } catch (err) {
+    if (request !== S.libraryRequest) return;
+    S.libraryLoading = false;
+    $('#list').innerHTML = `<div class="empty"><b>Could not load this page</b>${esc(err.message)}</div>`;
+  }
+}
+
+async function refreshLibraryMeta() {
+  try {
+    const data = await api(libraryPageUrl(0, 1));
+    if (S.libVersion !== undefined && data.version !== S.libVersion && S.mode === 'browse' && S.tab === 'library') {
+      await loadLibraryPage();
+      return;
+    }
+    S.topics = data.topics;
+    S.libraryCounts = data.counts;
+    S.libraryTotal = data.total;
+    S.libVersion = data.version;
+    renderTree();
+    if (S.mode === 'browse' && S.tab === 'library') { renderHead(); renderList(); }
+  } catch {}
 }
 
 function select(t, s) {
@@ -82,35 +168,32 @@ function select(t, s) {
   S.mode = 'browse'; S.search = null; S.limit = PAGE; $('#search').value = '';
   local.set('sel', S.sel);
   closeReader();
-  render();
-  if (s && S.tab === 'discover') loadDiscover();
+  if (S.tab === 'library') loadLibraryPage();
+  else { render(); if (s) loadDiscover(); }
 }
 
 function render() { renderTree(); renderDest(); renderHead(); renderList(); }
 
 /* ------------------------------------------------------------ sidebar */
 function renderTree() {
-  const counts = {};
-  for (const a of S.articles) {
-    counts[a.topic] = (counts[a.topic] || 0) + 1;
-    counts[key(a.topic, a.subtopic)] = (counts[key(a.topic, a.subtopic)] || 0) + 1;
-  }
   const isSel = (t, s) => S.mode === 'browse' && S.sel.topic === t && S.sel.sub === s;
   let h = `<button class="tree-item tree-all ${isSel(null, null) ? 'active' : ''}" data-t="" data-s="">
-    <span class="label">All articles</span><span class="count">${S.articles.length}</span></button>
+    <span class="label">Articles &amp; research</span><span class="count">${fmtCount(S.libraryCounts.total)}</span></button>
     <button class="tree-item tree-all tree-discover ${S.mode === 'discover' ? 'active' : ''}" data-discover-all>
     <span class="label">✦ Discover</span><span class="count">${S.suggest?.items ? S.suggest.items.length : ''}</span></button>
     <button class="tree-item tree-all tree-notebook ${S.mode === 'notebook' ? 'active' : ''}" data-notebook>
-    <span class="label">✎ Notebook</span><span class="count">${S.articles.filter(a => a.notes_count).length || ''}</span></button>`;
+    <span class="label">✎ Notebook</span><span class="count">${fmtCount(S.libraryCounts.noted) || ''}</span></button>
+    <button class="tree-item tree-all tree-cves ${S.mode === 'cves' ? 'active' : ''}" data-cves>
+    <span class="label">Vulnerabilities</span><span class="count">${S.cveCatalog.count ? fmtCount(S.cveCatalog.count) : S.cves.length || ''}</span></button>`;
   for (const t of S.topics) {
     const open = S.open.has(t.id);
     h += `<div class="${open ? 'open' : ''}" data-group="${esc(t.id)}">
       <button class="tree-item tree-topic ${isSel(t.id, null) ? 'active' : ''}" data-t="${esc(t.id)}" data-s="">
-        <span class="chev">▶</span><span class="label">${esc(t.name)}</span><span class="count">${counts[t.id] || ''}</span>
+        <span class="chev">▶</span><span class="label">${esc(t.name)}</span><span class="count">${fmtCount(libraryCount(t.id)) || ''}</span>
       </button><div class="subs">`;
     for (const s of t.subtopics) {
       h += `<button class="tree-item tree-sub ${isSel(t.id, s.id) ? 'active' : ''}" data-t="${esc(t.id)}" data-s="${esc(s.id)}">
-        <span class="label"><span class="hash">#</span> ${esc(s.name)}</span><span class="count">${counts[key(t.id, s.id)] || ''}</span></button>`;
+        <span class="label"><span class="hash">#</span> ${esc(s.name)}</span><span class="count">${fmtCount(libraryCount(t.id, s.id)) || ''}</span></button>`;
     }
     h += `<button class="tree-item tree-sub tree-add" data-add="${esc(t.id)}">+ ${t.id === 'custom' ? 'New topic' : 'Add subtopic'}</button></div></div>`;
   }
@@ -122,6 +205,7 @@ $('#tree').addEventListener('click', e => {
   if (add) return newTopic(add.dataset.add);
   if (e.target.closest('[data-discover-all]')) return openDiscover();
   if (e.target.closest('[data-notebook]')) return openNotebook();
+  if (e.target.closest('[data-cves]')) return openCves();
   const b = e.target.closest('.tree-item');
   if (!b) return;
   const t = b.dataset.t || null, s = b.dataset.s || null;
@@ -133,6 +217,191 @@ $('#tree').addEventListener('click', e => {
   select(t, s);
 });
 $('#newTopicBtn').onclick = () => newTopic('custom');
+
+async function openCves() {
+  S.mode = 'cves'; S.search = null; S.tab = 'library';
+  drawer(false); closeReader();
+  renderHead();
+  $('#list').innerHTML = '<div class="loading">Loading saved vulnerability records…</div>';
+  try {
+    const data = await api('/api/cves');
+    S.cves = data.items || [];
+    S.cvesLoaded = true;
+    S.cveCatalog = await api('/api/cves/catalog/status').catch(() => S.cveCatalog);
+    await searchCveCatalog(false);
+    renderTree(); renderHead(); renderCves();
+    if (S.cveCatalog.job?.state === 'running') pollCveCatalog();
+  } catch (err) {
+    $('#list').innerHTML = `<div class="empty"><b>Could not load CVEs</b>${esc(err.message)}</div>`;
+  }
+}
+
+function renderCveHead() {
+  const job = S.cveCatalog.job || {};
+  const busy = job.state === 'running';
+  const progress = job.phase?.startsWith('Importing') ? `${fmtCount(job.records || 0)} records` : job.total_bytes ? `${Math.min(100, Math.round(job.bytes * 100 / job.total_bytes))}%` : '';
+  $('#viewHead').innerHTML = `<div class="cve-intro">
+      <div><h1>Vulnerability records</h1><p>Search the complete official CVE List, then keep records you care about on your shelf.</p></div>
+      <div class="cve-catalog-sync"><div><b>Official CVE List V5</b><span id="cveCatalogStatus">${S.cveCatalog.count ? `${fmtCount(S.cveCatalog.count)} records indexed` : 'Full catalog not imported'}</span></div>
+        <button id="cveCatalogSync" class="btn ${S.cveCatalog.count ? 'ghost' : 'primary'}" ${busy ? 'disabled' : ''}>${busy ? `${esc(job.phase || 'Importing')} ${progress}` : S.cveCatalog.count ? 'Sync latest updates' : 'Import complete CVE catalog'}</button></div>
+      <form id="cveImportForm" class="cve-import-form">
+        <label for="cveId">CVE identifier</label>
+        <div class="cve-import-row"><input id="cveId" class="input" name="cve_id" required pattern="CVE-[0-9]{4}-[0-9]{4,}" placeholder="CVE-2024-12345" autocomplete="off" spellcheck="false">
+          <button class="btn primary" type="submit">Add and enrich</button></div>
+      </form>
+    </div>
+    <div class="cve-source-line"><span>Enrichment sources</span><b>NVD</b><b>CVE.org / MITRE</b><b>GitHub Advisories</b><b>CISA KEV</b><b>OSV</b><b>Red Hat</b><b>Microsoft</b><b>Cisco</b></div>
+    <div class="cve-catalog-search"><form id="cveCatalogForm" role="search"><input class="input" id="cveCatalogQuery" aria-label="Search CVE IDs and descriptions" placeholder="Search CVE IDs and descriptions" value="${esc(S.cveCatalogQuery)}"><input class="input" id="cveCatalogYear" aria-label="Filter by CVE year" inputmode="numeric" pattern="[0-9]{4}" placeholder="Year" value="${esc(S.cveCatalogYear)}"><button class="btn ghost">Search catalog</button></form>
+      <div class="tabs cve-tabs"><span class="tab active">Official catalog · ${fmtCount(S.cveCatalogTotal || S.cveCatalog.count)}</span><span class="tab-note">Your shelf · ${S.cves.length} saved · ${S.cveCatalog.last_sync ? `Updated ${fmtDate(S.cveCatalog.last_sync.slice(0, 10))}` : 'Not yet synced'}</span></div></div>`;
+  $('#cveCatalogSync').onclick = async () => {
+    try {
+      await api('/api/cves/catalog/sync', { method: 'POST' });
+      toast('Started full CVE List V5 import');
+      pollCveCatalog();
+    } catch (err) { toast(`Could not start catalog import: ${err.message}`, 5000); }
+  };
+  $('#cveCatalogForm').onsubmit = async e => { e.preventDefault(); S.cveCatalogQuery = $('#cveCatalogQuery').value.trim(); S.cveCatalogYear = $('#cveCatalogYear').value.trim(); S.cveCatalogOffset = 0; await searchCveCatalog(); };
+  $('#cveImportForm').onsubmit = async e => {
+    e.preventDefault();
+    const input = $('#cveId'), button = e.submitter || $('#cveImportForm button');
+    const cve_id = input.value.trim().toUpperCase();
+    button.disabled = true; button.textContent = 'Checking sources…';
+    try {
+      const record = await api('/api/cves/import', { method: 'POST', body: { cve_id } });
+      const index = S.cves.findIndex(x => x.id === record.id);
+      if (index < 0) S.cves.unshift(record); else S.cves[index] = record;
+      input.value = '';
+      renderTree(); renderCveHead(); renderCves();
+      toast(`Added ${record.id}`);
+    } catch (err) { toast(`Could not add CVE: ${err.message}`, 5000); }
+    finally { button.disabled = false; button.textContent = 'Add and enrich'; }
+  };
+  $('#cveId').oninput = e => { e.target.value = e.target.value.toUpperCase(); };
+}
+
+async function searchCveCatalog(render = true) {
+  const params = new URLSearchParams({ q: S.cveCatalogQuery || '', limit: '40', offset: String(S.cveCatalogOffset || 0) });
+  if (S.cveCatalogYear) params.set('year', S.cveCatalogYear);
+  try {
+    const data = await api(`/api/cves/catalog/search?${params}`);
+    S.cveCatalogItems = data.items || []; S.cveCatalogTotal = data.total || 0;
+    if (render && S.mode === 'cves') { renderCveHead(); renderCves(); }
+  } catch (err) {
+    S.cveCatalogItems = []; S.cveCatalogTotal = 0;
+    if (render) { $('#list').innerHTML = `<div class="empty"><b>Catalog search failed</b>${esc(err.message)}</div>`; }
+  }
+}
+
+function pollCveCatalog() {
+  clearTimeout(S.cveCatalogPoll);
+  const poll = async () => {
+    try {
+      S.cveCatalog = await api('/api/cves/catalog/status');
+      if (S.mode === 'cves') { renderCveHead(); renderCves(); }
+      if (S.cveCatalog.job?.state === 'running') S.cveCatalogPoll = setTimeout(poll, 1200);
+      else if (S.cveCatalog.job?.state === 'complete') { await searchCveCatalog(false); if (S.mode === 'cves') { renderTree(); renderCveHead(); renderCves(); } toast(`Catalog ready · ${fmtCount(S.cveCatalog.count)} CVE records`); }
+      else if (S.cveCatalog.job?.state === 'error') toast(`Catalog import stopped: ${S.cveCatalog.job.error}`, 7000);
+    } catch { S.cveCatalogPoll = setTimeout(poll, 4000); }
+  };
+  S.cveCatalogPoll = setTimeout(poll, 300);
+}
+
+const scoreFor = c => c.scores?.slice().sort((a, b) => (parseFloat(b.version) || 0) - (parseFloat(a.version) || 0))[0];
+function renderCves() {
+  const saved = S.cves.length ? `<div class="cve-section-head">On your shelf <span>${fmtCount(S.cves.length)} saved records</span></div>` + S.cves.map(c => {
+    const score = scoreFor(c), kev = c.kev?.in_catalog;
+    return `<article class="cve-card"><button class="cve-card-main" data-saved-cve-open="${esc(c.id)}">
+      <span class="cve-id">${esc(c.id)}</span>${kev ? '<span class="cve-kev">Known exploited</span>' : ''}
+      ${score ? `<span class="cve-score sev-${esc((score.severity || '').toLowerCase())}">${esc(score.severity || 'CVSS')} ${esc(score.score)}</span>` : ''}
+      <span class="cve-description">${esc(c.description || 'Description not available from connected sources.')}</span>
+      <span class="cve-meta">${c.cpes?.length || 0} CPEs · ${(c.package_advisories || []).length} package advisories · ${(c.references || []).length} references</span></button>
+      <button class="cve-remove" data-cve-remove="${esc(c.id)}" aria-label="Remove ${esc(c.id)} from your shelf" title="Remove from shelf">×</button></article>`;
+  }).join('') : '';
+  let catalog = '';
+  if (!S.cveCatalogItems.length) {
+    const job = S.cveCatalog.job || {};
+    catalog = job.state === 'error'
+      ? `<div class="empty cve-empty"><b>Catalog import could not finish</b>${esc(job.error || 'Try again later.')}</div>`
+      : job.state === 'running'
+        ? `<div class="empty cve-empty"><b>Building the complete CVE catalog</b>${esc(job.phase || 'Import in progress')} · ${fmtCount(job.records || 0)} records indexed</div>`
+        : S.cveCatalog.count
+          ? '<div class="empty cve-empty"><b>No CVEs match this search</b>Try a different ID, keyword, or year.</div>'
+          : '<div class="empty cve-empty"><b>Import the full official catalog</b>CVE List V5 contains the complete CVE record archive. The download is large; the import runs in the background and builds a local searchable index.</div>';
+  } else {
+    catalog = `<div class="cve-section-head">Complete CVE List V5 <span>${fmtCount(S.cveCatalogTotal)} matches</span></div>`
+      + S.cveCatalogItems.map(c => `<article class="cve-card">
+        <button class="cve-card-main" data-cve-open="${esc(c.id)}"><span class="cve-id">${esc(c.id)}</span><span class="cve-state">${esc(c.state || '')}</span>
+          <span class="cve-description">${esc(c.description || 'Description not available in the canonical CVE record.')}</span>
+          <span class="cve-meta">${esc(c.published ? `Published ${fmtDate(c.published.slice(0, 10))}` : `CVE List V5 · ${c.year}`)}${c.updated ? ` · Updated ${fmtDate(c.updated.slice(0, 10))}` : ''}</span></button>
+        <button class="btn small ghost" data-cve-save="${esc(c.id)}">${S.cves.some(x => x.id === c.id) ? 'Refresh' : 'Add to shelf'}</button></article>`).join('')
+      + `<div class="cve-page"><span>${fmtCount(S.cveCatalogTotal)} records</span><button class="btn small ghost" data-cve-prev ${S.cveCatalogOffset <= 0 ? 'disabled' : ''}>Previous</button><button class="btn small ghost" data-cve-next ${S.cveCatalogOffset + 40 >= S.cveCatalogTotal ? 'disabled' : ''}>Next</button></div>`;
+  }
+  $('#list').innerHTML = saved + catalog;
+  $('#list').querySelectorAll('[data-cve-open]').forEach(b => b.onclick = () => showCatalogCve(b.dataset.cveOpen));
+  $('#list').querySelectorAll('[data-saved-cve-open]').forEach(b => b.onclick = () => showCve(b.dataset.savedCveOpen));
+  $('#list').querySelectorAll('[data-cve-remove]').forEach(b => b.onclick = async () => {
+    try { await api(`/api/cves/${encodeURIComponent(b.dataset.cveRemove)}`, { method: 'DELETE' });
+      S.cves = S.cves.filter(x => x.id !== b.dataset.cveRemove); renderTree(); renderCveHead(); renderCves();
+    } catch (err) { toast(err.message); }
+  });
+  $('#list').querySelectorAll('[data-cve-save]').forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = 'Enriching…';
+    try { const record = await api('/api/cves/import', { method: 'POST', body: { cve_id: b.dataset.cveSave } });
+      const i = S.cves.findIndex(x => x.id === record.id); if (i < 0) S.cves.unshift(record); else S.cves[i] = record;
+      renderTree(); renderCveHead(); renderCves(); toast(`Added ${record.id} to your shelf`);
+    } catch (err) { b.disabled = false; b.textContent = 'Try again'; toast(`Could not enrich CVE: ${err.message}`, 5000); }
+  });
+  $('#list').querySelector('[data-cve-prev]')?.addEventListener('click', async () => { S.cveCatalogOffset = Math.max(0, S.cveCatalogOffset - 40); await searchCveCatalog(); });
+  $('#list').querySelector('[data-cve-next]')?.addEventListener('click', async () => { S.cveCatalogOffset += 40; await searchCveCatalog(); });
+}
+
+async function showCatalogCve(id) {
+  try {
+    const raw = await api(`/api/cves/catalog/${encodeURIComponent(id)}`);
+    const meta = raw.cveMetadata || {}, containers = raw.containers || {};
+    const allContainers = [containers.cna || {}, ...(containers.adp || [])];
+    const descriptions = allContainers.flatMap(x => x.descriptions || []);
+    const references = allContainers.flatMap(x => x.references || []).map(x => x.url).filter(Boolean);
+    const affected = allContainers.flatMap(x => x.affected || []);
+    const metrics = allContainers.flatMap(x => x.metrics || []);
+    const scores = metrics.flatMap(x => Object.entries(x).filter(([k, v]) => k.startsWith('cvss') && v?.baseScore != null).map(([k, v]) => ({ version: v.version || k.replace('cvss', ''), score: v.baseScore, severity: v.baseSeverity, vector: v.vectorString })));
+    const normalized = { id, description: descriptions.find(x => x.lang?.toLowerCase().startsWith('en'))?.value || descriptions[0]?.value || '', published: meta.datePublished, updated: meta.dateUpdated, scores, references, affected, sources: { cve_org_mitre: raw }, source_errors: {}, package_advisories: [], cpes: [], vendor_references: [], raw_record: raw };
+    showCve(id, normalized);
+  } catch (err) { toast(`Could not open ${id}: ${err.message}`); }
+}
+
+function showCve(id, loaded = null) {
+  const c = loaded || S.cves.find(x => x.id === id);
+  if (!c) return;
+  const score = scoreFor(c);
+  const sourceNames = ['nvd', 'cve_org_mitre', 'github_advisories', 'cisa_kev', 'osv', 'redhat', 'msrc', 'cisco'];
+  const sourceRows = sourceNames.map(name => {
+    const data = c.sources?.[name];
+    const count = Array.isArray(data) ? data.length : data ? 1 : 0;
+    const error = c.source_errors?.[name];
+    return `<div class="source-status"><b>${esc(name.replaceAll('_', ' '))}</b><span>${error ? esc(error) : `${count} record${count === 1 ? '' : 's'}`}</span></div>`;
+  }).join('');
+  const refs = (c.references || []).map(url => `<a href="${esc(safeUrl(url))}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`).join('');
+  const cpes = (c.cpes || []).map(x => `<code>${esc(x)}</code>`).join('');
+  const affected = (c.affected || []).map(x => `<pre>${esc(JSON.stringify(x, null, 2))}</pre>`).join('');
+  const packages = (c.package_advisories || []).map(x => `<div class="package-advisory"><b>${esc(x.ecosystem || 'Package')} · ${esc(x.name || x.purl || 'affected package')}</b>
+      <small>${esc(x.source || '')}</small><span>Vulnerable: ${esc(x.vulnerable || 'not specified')}</span><span>Fixed: ${esc(x.fixed || 'no fixed version listed')}</span>
+      ${x.url ? `<a href="${esc(safeUrl(x.url))}" target="_blank" rel="noopener noreferrer">Open advisory</a>` : ''}</div>`).join('');
+  const kev = c.kev?.entry;
+  dialog({ title: c.id, submit: 'Close', body: `<div class="cve-detail">
+    <p>${esc(c.description || 'No English description returned by available sources.')}</p>
+    ${score ? `<div class="cve-detail-score"><b>CVSS ${esc(score.version)} · ${esc(score.score)}</b><span>${esc(score.severity || '')}</span><code>${esc(score.vector || '')}</code></div>` : '<p class="hint">No CVSS score returned.</p>'}
+    ${kev ? `<section><h4>CISA Known Exploited Vulnerabilities</h4><p>${esc(kev.requiredAction || '')} ${kev.dueDate ? `Due ${esc(kev.dueDate)}.` : ''}</p></section>` : ''}
+    <section><h4>Vendor advisories</h4>${c.vendor_references?.length ? c.vendor_references.map(u => `<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>`).join('') : '<p class="hint">No Microsoft, Cisco, or Red Hat reference is present in the source records.</p>'}</section>
+    <section><h4>Vulnerable packages and fixes</h4>${packages || '<p class="hint">No package ranges or fixed versions returned by GitHub Advisories or OSV.</p>'}</section>
+    <section><h4>Affected products · CPE</h4>${cpes || '<p class="hint">No CPEs returned by NVD.</p>'}</section>
+    <section><h4>Canonical affected records</h4>${affected || '<p class="hint">No affected-version records returned by CVE.org / MITRE.</p>'}</section>
+    <section><h4>References</h4>${refs || '<p class="hint">No references returned.</p>'}</section>
+    <section><h4>Record metadata</h4><p>${esc(c.published ? `Published ${c.published}` : '')}${c.updated ? ` · Updated ${esc(c.updated)}` : ''}</p></section>
+    <section><h4>Source status</h4>${sourceRows}</section>
+    ${c.raw_record ? `<details><summary>Complete CVE JSON 5 record</summary><pre>${esc(JSON.stringify(c.raw_record, null, 2))}</pre></details>` : ''}
+  </div>` });
+}
 
 /* ------------------------------------------------------------ phone layout
    On a narrow screen the sidebar is a drawer and the paste form folds behind a button. Both are
@@ -197,15 +466,18 @@ function renderDest() { $('#pasteDest').innerHTML = destOptions(currentDest()); 
 
 /* ------------------------------------------------------------ header */
 function renderHead() {
+  if (S.mode === 'cves') return renderCveHead();
   if (S.mode === 'search') return renderSearchHead();
   if (S.mode === 'discover') return renderDiscoverHead();
   if (S.mode === 'notebook') return renderNotebookHead();
   const t = topic(S.sel.topic), s = S.sel.sub && sub(S.sel.topic, S.sel.sub);
+  const home = !t && !s && S.tab === 'library';
   const title = s ? s.name : t ? t.name : 'All articles';
-  const crumb = ['Medium-Library', t?.id, s?.id].filter(Boolean).map(x => `<span>${esc(x)}</span>`).join('');
-  const scope = scopeArticles();
-  const access = [['all', 'All', scope.length], ['free', 'Free', scope.filter(a => a.locked === false).length],
-    ['locked', '🔒 Member-only', scope.filter(a => a.locked === true).length]];
+  const crumb = ['Library of Babel', t?.id, s?.id].filter(Boolean).map(x => `<span>${esc(x)}</span>`).join('');
+  const scopeTotal = libraryCount(S.sel.topic, S.sel.sub);
+  const free = libraryCount(S.sel.topic, S.sel.sub, 'free');
+  const locked = libraryCount(S.sel.topic, S.sel.sub, 'locked');
+  const access = [['all', 'All', scopeTotal], ['free', 'Free', free], ['locked', '🔒 Member-only', locked]];
   let tags = '';
   if (s) {
     tags = `<div class="tags"><span class="crumb">Discover pulls from Medium tags:</span>
@@ -214,11 +486,19 @@ function renderHead() {
       ${s.custom ? '<button class="linkish" id="delSub" style="color:var(--danger)">delete topic</button>' : ''}</div>`;
   }
   $('#viewHead').innerHTML = `
+    ${home ? `<section class="home-intro">
+      <div class="home-intro-copy"><h1>A reading room for every kind of signal.</h1><p>Keep the articles that stay with you. Make room for research and vulnerability records as your library grows.</p></div>
+      <div class="home-source-row" aria-label="Library source types">
+        <div class="home-source current"><span>Articles</span><small>Medium search · ${fmtCount(S.libraryCounts.total)} saved</small></div>
+        <div class="home-source preview"><span>Research</span><small>Workspace preview</small></div>
+        <button class="home-source cve-source" type="button" data-open-cves><span>Vulnerabilities</span><small>CVEs · ${S.cvesLoaded ? `${S.cves.length} saved` : 'open shelf to load'}</small></button>
+      </div>
+    </section>` : ''}
     <div class="crumb">${crumb}</div>
-    <div class="view-title"><h1>${esc(title)}</h1></div>
+    ${home ? '' : `<div class="view-title"><h1>${esc(title)}</h1></div>`}
     ${tags}
     <div class="tabs">
-      <button class="tab ${S.tab === 'library' ? 'active' : ''}" data-tab="library">Library · ${scope.length}</button>
+      <button class="tab ${S.tab === 'library' ? 'active' : ''}" data-tab="library">Library · ${fmtCount(scopeTotal)}</button>
       <button class="tab ${S.tab === 'discover' ? 'active' : ''}" data-tab="discover" ${s ? '' : 'disabled title="Pick a subtopic to discover new articles"'}>Discover</button>
       ${S.tab === 'discover' && s ? '<span class="tab-note"><button class="linkish" id="refreshDiscover">refresh</button></span>' : ''}
       ${S.tab === 'library' ? `<span class="access">${access.map(([k, label, n]) =>
@@ -228,6 +508,7 @@ function renderHead() {
     S.tab = b.dataset.tab; renderHead(); renderList();
     if (S.tab === 'discover') loadDiscover();
   });
+  $('#viewHead').querySelector('[data-open-cves]')?.addEventListener('click', openCves);
   $('#editTags') && ($('#editTags').onclick = () => editTags(S.sel.topic, s));
   $('#delSub') && ($('#delSub').onclick = () => deleteSub(S.sel.topic, s));
   $('#refreshDiscover') && ($('#refreshDiscover').onclick = () => loadDiscover(true));
@@ -235,56 +516,19 @@ function renderHead() {
     S.access = b.dataset.access;
     S.limit = PAGE;
     local.set('access', S.access);
-    renderHead(); renderList();
+    loadLibraryPage();
   });
 }
 
 /* ------------------------------------------------------------ lists */
-function scopeArticles() {
-  return S.articles.filter(a => (!S.sel.topic || a.topic === S.sel.topic) && (!S.sel.sub || a.subtopic === S.sel.sub));
-}
-
 function visibleArticles() {
-  return scopeArticles().filter(a => S.access === 'all' || (S.access === 'locked' ? a.locked === true : a.locked === false));
+  return S.articles;
 }
 
-// Your own library is searched here in the browser, with the same idea the server uses on the
-// index: a title match counts for more than a mention in the snippet, words that sit together
-// count for more than words scattered apart, and everything that matches is ranked, not just
-// filtered. Quotes and -exclusions work the same way as they do on Medium-wide search.
-function queryParts(q) {
-  const phrases = [], plain = [], minus = [];
-  for (const tok of q.toLowerCase().match(/-?"[^"]*"|\S+/g) || []) {
-    const neg = tok.startsWith('-'), body = (neg ? tok.slice(1) : tok).replace(/^"|"$/g, '');
-    const ws = body.match(/[a-z0-9]+/g) || [];
-    if (!ws.length) continue;
-    if (neg) minus.push(...ws);
-    else if (ws.length > 1 && /^-?"/.test(tok)) phrases.push(ws.join(' '));
-    else plain.push(...ws);
-  }
-  return { phrases, plain, minus, words: [...plain, ...phrases.flatMap(p => p.split(' '))] };
-}
-
-function libraryMatches(q) {
-  const { phrases, plain, minus, words } = queryParts(q);
-  if (!words.length) return [];
-  const scored = [];
-  for (const a of S.articles) {
-    const title = (a.title || '').toLowerCase();
-    const rest = `${a.author || ''} ${a.snippet || ''} ${a.topic} ${a.subtopic}`.toLowerCase();
-    if (minus.some(w => title.includes(w) || rest.includes(w))) continue;
-    if (phrases.some(p => !title.includes(p) && !rest.includes(p))) continue;
-    const inTitle = words.filter(w => title.includes(w)).length;
-    const anywhere = words.filter(w => title.includes(w) || rest.includes(w)).length;
-    if (!anywhere) continue;
-    const order = plain.map(w => title.indexOf(w)).filter(i => i >= 0);
-    const span = order.length > 1 ? Math.max(...order) - Math.min(...order) + 1 : 1;
-    scored.push([2.5 * (anywhere / words.length) + 1.2 * (inTitle / words.length)
-      + 0.6 * (order.length > 1 ? order.length / span : 0)
-      + 0.5 * phrases.filter(p => title.includes(p)).length
-      + 0.3 * (a.fetched ? 1 : 0), a]);
-  }
-  return scored.sort((x, y) => y[0] - x[0] || (y[1].added || '').localeCompare(x[1].added || '')).map(s => s[1]);
+function renderMoreButton(left) {
+  if (left <= 0) return;
+  $('#list').insertAdjacentHTML('beforeend', `<div class="more"><button class="btn" id="showMore">Show ${Math.min(PAGE, left)} more · ${left.toLocaleString()} left</button></div>`);
+  $('#showMore').onclick = () => loadLibraryPage(true);
 }
 
 function libraryCard(a, showLoc) {
@@ -317,12 +561,15 @@ function libraryCard(a, showLoc) {
 }
 
 function renderList() {
+  if (S.mode === 'cves') return renderCves();
   if (S.mode === 'search') return renderSearch();
   if (S.mode === 'discover') return renderDiscoverAll();
   if (S.mode === 'notebook') return renderNotebook();
   if (S.tab === 'discover' && S.sel.sub) return renderDiscover();
-  const items = visibleArticles();
-  if (!items.length && S.access !== 'all' && scopeArticles().length) {
+  if (S.libraryLoading && !S.articles.length) { $('#list').innerHTML = skeleton(4, 'Loading articles…'); return; }
+  const items = S.articles;
+  const scopeCount = libraryCount(S.sel.topic, S.sel.sub);
+  if (!items.length && S.access !== 'all' && scopeCount) {
     $('#list').innerHTML = `<div class="empty"><b>No ${S.access === 'free' ? 'free' : 'member-only'} articles here yet</b>Paywall status fills in as each article gets checked.</div>`;
     return;
   }
@@ -332,10 +579,9 @@ function renderList() {
       : 'Search all of Medium above, pick a subtopic and use Discover, or paste a Medium link.'}</div>`;
     return;
   }
-  const shown = items.slice(0, S.limit), left = items.length - shown.length;
-  $('#list').innerHTML = shown.map(a => libraryCard(a, !S.sel.sub)).join('')
-    + (left > 0 ? `<div class="more"><button class="btn" id="showMore">Show ${Math.min(PAGE, left)} more · ${left.toLocaleString()} left</button></div>` : '');
-  $('#showMore') && ($('#showMore').onclick = () => { S.limit += PAGE; renderList(); });
+  const shown = items, left = S.libraryTotal - shown.length;
+  $('#list').innerHTML = shown.map(a => libraryCard(a, !S.sel.sub)).join('');
+  renderMoreButton(left);
 }
 
 $('#list').addEventListener('click', async e => {
@@ -370,14 +616,13 @@ async function loadDiscover(force = false) {
 function renderDiscover() {
   const d = S.discover[key(S.sel.topic, S.sel.sub)];
   if (!d) { $('#list').innerHTML = skeleton(4, 'Fetching the latest stories from Medium…'); return; }
-  const saved = new Set(S.articles.map(a => a.url));
   const warn = d.errors?.length ? `<div class="warn">Some tags failed: ${d.errors.map(esc).join(' · ')}</div>` : '';
   if (!d.items.length) {
     $('#list').innerHTML = warn + '<div class="empty"><b>No stories found</b>Try different tags with “edit” above.</div>';
     return;
   }
   $('#list').innerHTML = warn + d.items.map((it, i) => {
-    const img = safeUrl(it.image), isSaved = saved.has(it.url);
+    const img = safeUrl(it.image), isSaved = !!it.saved;
     return `<article class="card ${img ? '' : 'noimg'}" data-discover="${i}" tabindex="0">
       <div>
         <div class="card-meta">
@@ -408,7 +653,9 @@ async function saveArticle(body) {
   try {
     const a = await api('/api/articles', { method: 'POST', body });
     const i = S.articles.findIndex(x => x.id === a.id);
-    if (i >= 0) S.articles[i] = a; else S.articles.unshift(a);
+    if (i >= 0) S.articles[i] = a;
+    await refreshLibraryMeta();
+    if (S.mode === 'browse' && S.tab === 'library') await loadLibraryPage();
     return a;
   } catch (err) { toast(err.message); return null; }
 }
@@ -580,7 +827,7 @@ function suggestScope() {
 
 function renderDiscoverHead() {
   const scope = suggestScope();
-  const access = [['all', 'All', scope.length], ['free', 'Free', scope.filter(a => a.locked === false).length],
+  const access = [['all', 'All', scopeTotal], ['free', 'Free', scope.filter(a => a.locked === false).length],
     ['locked', '🔒 Member-only', scope.filter(a => a.locked === true).length]];
   const topics = S.topics.filter(t => (discoverSource()?.items || []).some(it => it.topic === t.id));
   const forYou = S.sort === 'foryou';
@@ -642,7 +889,6 @@ function renderDiscoverAll() {
   const src = discoverSource();
   if (!src) { $('#list').innerHTML = skeleton(5); return; }
   if (src.error) { $('#list').innerHTML = `<div class="warn">${esc(src.error)}</div>`; return; }
-  const saved = new Set(S.articles.map(a => a.url));
   const items = suggestScope().filter(it => S.access === 'all' || (S.access === 'locked' ? it.locked === true : it.locked === false));
   if (!items.length) {
     $('#list').innerHTML = `<div class="empty"><b>Nothing new to suggest</b>${src.items.length || S.labels.length
@@ -664,7 +910,7 @@ function renderDiscoverAll() {
       ${it.snippet ? `<p class="card-snip">${esc(it.snippet)}</p>` : ''}
       ${becauseLine(it, s)}
       <div class="card-foot">
-        ${saved.has(it.url)
+        ${it.saved
           ? '<button class="btn small primary" data-act="read">Open</button><span class="pill ready">In library</span>'
           : '<button class="btn small primary" data-act="read">Read</button><button class="btn small" data-act="save">Save for later</button>'}
         ${S.sort === 'foryou' ? '<button class="btn small" data-act="dismiss" title="Stop suggesting this, and posts like it">Not for me</button>' : ''}
@@ -744,9 +990,16 @@ $('#search').addEventListener('keydown', e => { if (e.key === 'Escape' && !S.rea
 async function runSearch(q) {
   closeReader();
   S.mode = 'search';
-  const s = S.search = { q, dest: S.search?.dest || currentDest(), items: [], next: null, loading: true, error: null };
+  const s = S.search = { q, dest: S.search?.dest || currentDest(), items: [], savedItems: [], savedTotal: 0,
+    savedLoading: true, next: null, loading: true, error: null };
   renderTree(); renderHead(); renderList();
   $('#searchForm').classList.add('busy');
+  api(`/api/library/search?q=${encodeURIComponent(q)}`).then(data => {
+    s.savedItems = data.items || [];
+    s.savedTotal = data.total || 0;
+    s.savedLoading = false;
+    if (S.search === s) renderList();
+  }).catch(() => { s.savedLoading = false; });
   try {
     const r = await api(`/api/search?q=${encodeURIComponent(q)}`);
     s.items = r.items; s.next = r.next; s.provider = r.provider; s.notice = r.notice; s.parsed = r.parsed;
@@ -796,10 +1049,10 @@ function renderSearchHead() {
 
 function renderSearch() {
   const s = S.search;
-  const mine = libraryMatches(s.q);
-  const saved = new Set(S.articles.map(a => a.url));
+  const mine = s.savedItems || [];
   let h = '';
-  if (mine.length) h += `<div class="section-label">In your library · ${mine.length}</div>` + mine.slice(0, 20).map(a => libraryCard(a, true)).join('');
+  if (s.savedLoading) h += '<div class="section-label">Searching saved articles…</div>';
+  if (mine.length) h += `<div class="section-label">In your library · ${fmtCount(s.savedTotal)}</div>` + mine.map(a => libraryCard(a, true)).join('');
   const via = { index: 'from your local index', feeds: 'from live Medium tag feeds' }[s.provider] || '';
   h += `<div class="section-label">On Medium${s.items.length ? ` · ${s.items.length}` : ''}${via ? ` · ${via}` : ''}</div>`;
   if (s.notice) h += `<div class="warn">${esc(s.notice)}</div>`;
@@ -817,7 +1070,7 @@ function renderSearch() {
       <h2 class="card-title">${esc(it.title)}</h2>
       ${it.snippet ? `<p class="card-snip">${esc(it.snippet)}</p>` : ''}
       ${it.missing?.length ? `<p class="because">Doesn't mention ${it.missing.map(w => `<b>${esc(w)}</b>`).join(', ')}</p>` : ''}
-      <div class="card-foot">${saved.has(it.url)
+      <div class="card-foot">${it.saved
         ? '<button class="btn small primary" data-act="read">Open</button><span class="pill ready">In library</span>'
         : '<button class="btn small primary" data-act="read">Read</button><button class="btn small" data-act="save">Save for later</button>'}
         ${it.locked === true ? '<span class="pill locked">🔒 Member-only</span>' : it.locked === false ? '<span class="pill free">Free</span>' : ''}
@@ -858,19 +1111,8 @@ async function refreshIndex() {
   if (v !== S.libVersion && !$('#dlg').open && !S.reader && !S.pendingRemovals.size && Date.now() - (S.lastLoad || 0) > 20000) {
     S.libVersion = v;
     S.lastLoad = Date.now();
-    const onScreen = () => (S.mode === 'browse' && S.tab === 'library'
-      ? visibleArticles().slice(0, S.limit).map(a => `${a.id}${a.pdf_url}${a.locked}${a.claps}`).join() : null);
-    const before = onScreen();
-    const data = await api('/api/library').catch(() => null);
-    if (!data) return;
-    S.topics = data.topics; S.articles = data.articles;
-    renderTree();
-    // the curator adds articles in the background; don't make the list jump under the reader's eyes
-    if (before !== onScreen()) {
-      const scroll = $('.view').scrollTop;
-      renderHead(); renderList();
-      $('.view').scrollTop = scroll;
-    }
+    if (S.mode === 'browse' && S.tab === 'library') await loadLibraryPage();
+    else await refreshLibraryMeta();
   }
 }
 
@@ -1519,7 +1761,7 @@ function saveNotesNow() {
   const a = R.article;
   if (!a || !R.dirty) return;
   R.dirty = false;
-  const raw = JSON.stringify({ notes: R.notes.notes || '', highlights: R.notes.highlights.map(({ _orphan, ...h }) => h) });
+  const raw = JSON.stringify({ notes: R.notes.notes || '', summary: R.notes.summary || '', highlights: R.notes.highlights.map(({ _orphan, ...h }) => h) });
   try {
     fetch(`/api/articles/${a.id}/notes`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: raw, keepalive: raw.length < 60000,
@@ -1607,7 +1849,7 @@ async function editTags(t, s) {
 }
 
 async function deleteSub(t, s) {
-  const n = S.articles.filter(a => a.topic === t && a.subtopic === s.id).length;
+  const n = libraryCount(t, s.id);
   const ok = await dialog({
     title: `Delete “${s.name}”?`,
     body: `<p style="margin:0;color:var(--muted)">${n ? `Its ${n} article${n > 1 ? 's are' : ' is'} removed from the library; downloaded PDFs stay on disk in Medium-Library/${esc(t)}/${esc(s.id)}.` : 'This topic has no articles.'}</p>`,
@@ -1628,8 +1870,12 @@ async function moveArticle(a) {
   const [t, s] = v.dest.split('/');
   try {
     const na = await api(`/api/articles/${a.id}`, { method: 'PATCH', body: { topic: t, subtopic: s } });
-    S.articles[S.articles.findIndex(x => x.id === a.id)] = na;
-    render(); toast('Moved');
+    const i = S.articles.findIndex(x => x.id === a.id);
+    if (i >= 0) S.articles[i] = na;
+    await refreshLibraryMeta();
+    if (S.mode === 'browse' && S.tab === 'library') await loadLibraryPage();
+    else render();
+    toast('Moved');
   } catch (err) { toast(err.message); }
 }
 
@@ -1666,7 +1912,9 @@ async function deleteNow(a) {
   try {
     await api(`/api/articles/${a.id}`, { method: 'DELETE' });
     S.articles = S.articles.filter(x => x.id !== a.id);
-    render();
+    await refreshLibraryMeta();
+    if (S.mode === 'browse' && S.tab === 'library') await loadLibraryPage();
+    else render();
   } catch (err) {
     if (!S.articles.includes(a)) { S.articles.unshift(a); render(); }
     toast(err.message, 4000);

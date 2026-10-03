@@ -8,7 +8,7 @@
 
    Served from / (see app.py) so its scope covers the whole app, not just /static/. */
 
-const VERSION = 'v1';
+const VERSION = 'v4';
 const SHELL = `shell-${VERSION}`;
 const FILES = `files-${VERSION}`;
 const DATA = `data-${VERSION}`;
@@ -20,10 +20,10 @@ const SHELL_URLS = [
   '/static/style.css',
   '/static/article.css',
   '/static/app.js',
+  '/static/babel.js',
   '/static/article.js',
   '/static/manifest.webmanifest',
-  '/static/apple-touch-icon.png',
-  '/static/icon-192.png',
+  '/static/babel-mark.svg',
   '/static/vendor/katex/katex.min.css',
   '/static/vendor/katex/katex.min.js',
   '/static/vendor/katex/auto-render.min.js',
@@ -115,17 +115,20 @@ self.addEventListener('fetch', e => {
     e.respondWith(rangeRequest(req));
     return;
   }
-  if (req.mode === 'navigate') {
+  if (req.mode === 'navigate' && url.pathname === '/') {
     e.respondWith(networkFirst(req, SHELL).catch(() => caches.match('/')));
     return;
   }
-  if (url.pathname === '/api/library') {
+  // The paged library is the boot payload now; cache its first page as the offline shelf view.
+  if (url.pathname === '/api/library' || url.pathname === '/api/library/page') {
     e.respondWith(networkFirst(req, DATA));
     return;
   }
   if (url.pathname.startsWith('/api/')) return;           // search, jobs, index status: live only
   if (url.pathname.startsWith('/files/')) {
-    e.respondWith(cacheFirst(req, FILES));
+    // images never change under a given name; article HTML/PDF are replaced by a re-download, so the
+    // network wins and the cache is only the offline copy
+    e.respondWith(url.pathname.includes('/images/') ? cacheFirst(req, FILES) : networkFirst(req, FILES));
     return;
   }
   if (url.pathname.startsWith('/static/')) {

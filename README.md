@@ -1,16 +1,12 @@
-<h1 align="center">Medium Library</h1>
+<h1 align="center">Library of Babel</h1>
 
 <p align="center">
-  A local, curated library of Medium articles — organized by topic, saved as clean PDFs,<br>
-  searchable offline, and recommended from what you actually read.
+  A personal reading room for articles, research, and vulnerability records.<br>
+  Keep long-form reading, notes, and CVE intelligence together.
 </p>
 
 <p align="center">
-  <img src="docs/images/library.png" alt="The library: topics and subtopics in the sidebar, article cards with Free and Member-only badges" width="900">
-</p>
-
-<p align="center">
-  <sub>Everything runs on your machine. No API keys, no accounts, no outside search service.</sub>
+  <sub>Your library uses a fast E: cache with an encrypted Telegram archive. Public CVE sources are checked when you import a record.</sub>
 </p>
 
 ---
@@ -18,17 +14,13 @@
 ## Contents
 
 - [Run it](#run-it) · [How it works](#how-it-works)
-- [The library](#the-library) · [Discover and recommendations](#discover-and-recommendations) · [Reading, highlights, and notes](#reading-highlights-and-notes)
+- [The library](#the-library) · [Discover and recommendations](#discover-and-recommendations) · [Reading, highlights, and notes](#reading-highlights-and-notes) · [Vulnerabilities](#vulnerabilities)
 - [Search](#search) · [The curator](#the-curator) · [Speed](#speed) · [Rate limits](#rate-limits)
 - [Settings](#settings) · [Files](#files)
 
 ## Run it
 
-Double-click `run.bat`, or:
-
-```bash
-.venv\Scripts\python app.py
-```
+Double-click `run.bat` to launch the app with its E: cache and Telegram restore/sync hooks enabled.
 
 Then open http://127.0.0.1:8765. On first run, `run.bat` creates `.venv`, installs
 `requirements.txt`, and downloads Chromium for Playwright.
@@ -174,6 +166,23 @@ Highlights, notes, and summaries live in `notes/<article id>.json`, so they surv
 moving an article. Very long articles can exceed Adobe Acrobat's 200-inch page limit, though browsers
 open them fine.
 
+## Vulnerabilities
+
+Open **Vulnerabilities** in the sidebar and choose **Import complete CVE catalog** to download the
+official CVE List V5 baseline and its recent hourly deltas. The large first download runs in the
+background; its progress appears in the view. The searchable local index includes every CVE JSON 5
+record and preserves each complete source record, including CNA, CVE Program, and other ADP
+containers, affected versions, metrics, and references. Later updates use the repository's release
+deltas instead of downloading the full baseline again. Search by identifier, description, or year,
+open the complete canonical record, and add selected CVEs to your shelf.
+
+The CVE List index is stored in `CVEs/cvelistV5.sqlite3`; manually enriched shelf records remain in
+`CVEs/cves.json`. Add a CVE ID or choose **Add to shelf** to also check NVD for CVSS, CPE, and
+references; CVE.org/MITRE; GitHub Advisories and OSV for package ranges and fixes; CISA KEV for
+known exploitation; and Red Hat, Microsoft MSRC, and Cisco. Each source is queried independently.
+If set, `NVD_API_KEY` is sent to NVD to use its higher request allowance; the public API is queried
+without a key otherwise.
+
 ## Search
 
 The app has its own search engine — no API key, no outside search service.
@@ -273,9 +282,11 @@ for 15 minutes; if some tags fail, wait a minute and click **refresh**.
 | `HOST` | Listen address. Defaults to `0.0.0.0` for phone access on your network; use `127.0.0.1` for this computer only |
 | `MEDIUM_LIBRARY_DATA` | Where PDFs, `library.json`, and the search index live |
 
-By default data sits next to the app. If that drive drops below 10 GB free at startup, everything
-moves to `E:\storage\medium-library` once and the location is remembered in `data-location.txt`.
-The indexer pauses whenever its drive has less than 2 GB free.
+`run.bat` stores active data in `E:\storage\newsletter-active` for local-speed reads and writes.
+It restores the cache from the encrypted TGFS archive if the library, CVE database, or search index
+is missing. When the app exits, changed files are synced to Telegram. The recovery copy is kept in
+`E:\storage\newsletter-telegram-restorepoint-2026-10-03`. Use `run.bat` so the Telegram hooks run;
+launching `app.py` directly bypasses them. The indexer pauses whenever its drive has less than 2 GB free.
 
 ## Files
 
@@ -290,8 +301,11 @@ The indexer pauses whenever its drive has less than 2 GB free.
 | `recommender.py` | Ranks posts for **For you** from what you've read |
 | `polite.py` | One self-throttling HTTP client for every outside request |
 | `topics.py` | Default topic tree and Medium tags per subtopic |
+| `cve_sources.py` | On-demand CVE enrichment from NVD, CVE.org/MITRE, GitHub, CISA KEV, OSV, Red Hat, Microsoft, and Cisco |
+| `cve_catalog.py` | Full CVE List V5 baseline and hourly delta ingestion, SQLite search, canonical records |
 | `static/` | The UI, Babel animation, web-app manifest, icons and service worker |
 | `Medium-Library/` | Your articles, plus `library.json` |
+| `CVEs/` | `cvelistV5.sqlite3` full catalog and `cves.json` enriched shelf records |
 | `notes/` | Highlights, notes, and summaries, one file per article |
 | `selftest.py` | Offline self-test of the library API, search index, renderer and curator |
 

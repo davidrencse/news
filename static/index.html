@@ -4,21 +4,22 @@
   <meta charset="utf-8">
   <!-- viewport-fit=cover lets the layout run under the notch; the CSS pads with safe-area insets -->
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Medium Library</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
-
-  <!-- installable on a phone home screen: Android/Chrome reads the manifest, iOS the apple-* tags -->
-  <link rel="manifest" href="/static/manifest.webmanifest">
+  <title>Library of Babel — Reading desk</title>
+  <link rel="icon" type="image/svg+xml" href="/static/babel-mark.svg">
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+
+  <!-- installable on a phone home screen: browsers read the manifest and product icon -->
+  <link rel="manifest" href="/static/manifest.webmanifest">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-title" content="Library">
+  <meta name="apple-mobile-web-app-title" content="Library of Babel">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f7f7f3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#171d1a" media="(prefers-color-scheme: dark)">
   <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/static/article.css">
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/reading-refresh.css">
   <script>
     // applied before paint so a saved theme doesn't flash; app.js owns the toggle
     try { const t = JSON.parse(localStorage.getItem('theme')); if (t) document.documentElement.dataset.theme = t; } catch {}
@@ -29,8 +30,8 @@
   <div id="scrim" class="scrim" hidden></div>
   <aside id="sidebar" class="sidebar">
     <div class="brand">
-      <span class="logo">M</span>
-      <div><b>Medium Library</b><small>curated · offline · PDF</small></div>
+      <span class="logo" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M7 7.5h18v17H7z"/><path d="M11 12h10M11 16h10M11 20h6"/><circle cx="24" cy="8" r="3"/></svg></span>
+      <div><b>Library of Babel</b><small>articles · research · CVEs</small></div>
       <button id="themeBtn" class="btn ghost icon theme-btn" title="Toggle light/dark mode" aria-label="Toggle light/dark mode">◐</button>
       <button id="babelBtn" class="btn ghost icon babel-btn" aria-label="Library of Babel intro" aria-pressed="false" hidden>⬡</button>
     </div>
@@ -45,13 +46,13 @@
     <header class="topbar">
       <button id="menuBtn" class="btn ghost icon menu-btn" aria-label="Topics" aria-expanded="false" aria-controls="sidebar">☰</button>
       <form id="searchForm" class="searchform" role="search">
-        <input id="search" class="input search" type="search" placeholder="Search all of Medium   ( / )" autocomplete="off" aria-label="Search all of Medium">
+        <input id="search" class="input search" type="search" placeholder="Search your library or Medium   ( / )" autocomplete="off" aria-label="Search your library or Medium">
       </form>
-      <button id="pasteBtn" class="btn ghost icon paste-btn" aria-label="Paste a Medium link" aria-expanded="false" aria-controls="pasteForm">＋</button>
+      <button id="pasteBtn" class="btn ghost icon paste-btn" aria-label="Save a link" aria-expanded="false" aria-controls="pasteForm">＋</button>
       <form id="pasteForm" class="paste">
-        <input id="pasteUrl" class="input" placeholder="Paste a Medium article link…" required autocomplete="off" inputmode="url">
+        <input id="pasteUrl" class="input" placeholder="Paste a Medium article link · more sources soon" required autocomplete="off" inputmode="url">
         <select id="pasteDest" class="input" aria-label="Save to"></select>
-        <button type="submit" class="btn primary">Add &amp; read</button>
+        <button type="submit" class="btn primary">Save link</button>
       </form>
     </header>
 
@@ -93,11 +94,11 @@
   <button data-act="copy" title="Copy the selected text">Copy</button>
 </div>
 <div id="hlPop" class="hl-pop" hidden></div>
-<script src="/static/vendor/katex/katex.min.js"></script>
-<script src="/static/vendor/katex/auto-render.min.js"></script>
-<script src="/static/vendor/hljs/highlight.min.js"></script>
-<script src="/static/article.js"></script>
-<script src="/static/app.js"></script>
+<script defer src="/static/vendor/katex/katex.min.js"></script>
+<script defer src="/static/vendor/katex/auto-render.min.js"></script>
+<script defer src="/static/vendor/hljs/highlight.min.js"></script>
+<script defer src="/static/article.js"></script>
+<script defer src="/static/app.js"></script>
 <script type="module" src="/static/babel.js"></script>
 </body>
 </html>

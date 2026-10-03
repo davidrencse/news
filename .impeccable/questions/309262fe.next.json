@@ -1,0 +1,126 @@
+{
+  "title": "Choose the reading world",
+  "question": "The fresh roll assigned Cassette J-card. Which world feels right for long-form reading and moving across saved articles, research previews, and CVEs?",
+  "options": [
+    {
+      "id": "assigned",
+      "label": "Cassette J-card",
+      "kicker": "THE ROLL",
+      "lineage": "Hand-ruled cassette inlay cards and liner notes",
+      "thesis": "A folded reading queue keeps the source, order, and the reader’s own notes together.",
+      "palette": ["#f3f0e8", "#293b49", "#a34a36", "#8b8981"],
+      "materials": ["lined inlay stock", "ballpoint rules", "one printed spine stripe"],
+      "viewport": "The open J-card becomes the reader: a quiet left spine names source shelves, a narrow top strip identifies the selected article or CVE, the center holds a generous long-form reading measure, and the folded inner panel carries highlights and notes. Saved sources unfold into a legible, dated queue; no album artwork is invented.",
+      "risk": "The A/B split can feel imposed on articles and CVEs; the two sides must stay optional and never replace topic shelves.",
+      "raised": [
+        {"from": "Split-Flap Concourse", "raise": "A changed record keeps its identity and its notice until the reader has seen it."},
+        {"from": "Japanese Dense Web", "raise": "Source type and reading state remain distinct even in compact layouts."},
+        {"from": "Labanotation", "raise": "Reading progress has a real, continuous position in the margin."},
+        {"from": "Streaming Catalog Wall", "raise": "A source’s own real image may identify it; the interface never fabricates cover art."}
+      ],
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "spine and source shelves", "x": 0, "y": 0, "w": 2, "h": 10}, {"label": "document identification", "x": 2, "y": 0, "w": 10, "h": 1}, {"label": "open reading panel", "x": 3, "y": 2, "w": 6, "h": 8, "accent": true}, {"label": "fold-out notes and highlights", "x": 9, "y": 2, "w": 3, "h": 8}]}
+    },
+    {
+      "id": "model-pick",
+      "label": "Standards Draft and Errata",
+      "kicker": "IMPECCABLE’S PICK",
+      "lineage": "Internet standards, revision histories, and errata records",
+      "thesis": "Every source stays readable beside its provenance, section anchors, and changes.",
+      "palette": ["#f7f7f3", "#17212a", "#35635b", "#a54638"],
+      "materials": ["document margins", "revision marks", "numbered anchors"],
+      "viewport": "A focused document column with a stable source rail, section anchors, and a slim margin for highlights. An index links articles, research previews, and CVE records by topic.",
+      "risk": "The standards idiom is precise but may make general interest reading feel technical.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "source index", "x": 0, "y": 0, "w": 2, "h": 10}, {"label": "document identity and revision", "x": 2, "y": 0, "w": 10, "h": 1}, {"label": "anchored document", "x": 3, "y": 2, "w": 6, "h": 8, "accent": true}, {"label": "errata and personal notes", "x": 9, "y": 2, "w": 3, "h": 8}]}
+    },
+    {
+      "id": "challenger-transit-map",
+      "label": "Transit Diagram",
+      "verdict": "competitive",
+      "lineage": "Disciplined metropolitan transit maps",
+      "thesis": "Follow topic lines across article, research, and vulnerability shelves without losing your place.",
+      "palette": ["#172b43", "#f3eee3", "#b84638", "#63836e"],
+      "materials": ["fixed routes", "station labels", "quiet interchange marks"],
+      "viewport": "The reader remains a calm, conventional document; a separate topic diagram reveals the available branches and source interchanges, never shrinking the whole network into the reading view.",
+      "case": "Clear fit for moving among mixed sources; lower identification than a personal reading artifact.",
+      "risk": "Topic relationships could be mistaken for literal or curated connections that the app does not provide.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "topic routes and source stops", "x": 0, "y": 0, "w": 4, "h": 10, "accent": true}, {"label": "current source and document", "x": 4, "y": 0, "w": 8, "h": 10}]}
+    },
+    {
+      "id": "challenger-split-flap",
+      "label": "Split-Flap Status Board",
+      "verdict": "competitive",
+      "lineage": "Railway split-flap boards",
+      "thesis": "A changed record holds its place and makes its updated state easy to notice.",
+      "palette": ["#171b1e", "#f4f0e7", "#d79a42", "#a34035"],
+      "materials": ["fixed character cells", "ruled rows", "persistent change lamps"],
+      "viewport": "The reading pane stays settled while a compact register updates source metadata in place; a visible marked state distinguishes a real update from ordinary reading progress.",
+      "case": "Strong state clarity for updates; commuter urgency weakens the calm reading scene.",
+      "risk": "Animated updates would distract from long-form text and depend on update events the app may not have.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "stable topic rail", "x": 0, "y": 0, "w": 2, "h": 10}, {"label": "document", "x": 2, "y": 1, "w": 7, "h": 9, "accent": true}, {"label": "quiet update register", "x": 9, "y": 1, "w": 3, "h": 9}]}
+    },
+    {
+      "id": "challenger-dense-web",
+      "label": "Dense Utility Mosaic",
+      "verdict": "declined",
+      "lineage": "High-density Japanese utility sites",
+      "thesis": "Put many source tools and compact records within one glance.",
+      "palette": ["#fafaf7", "#1d2222", "#bd322b", "#d5d6d1"],
+      "materials": ["small modules", "hairline borders", "utility-red tabs"],
+      "viewport": "A dense shelf mosaic collapses into a text-only source index when an article is open.",
+      "case": "Kept: source type and reading state must remain explicit wherever compact metadata appears.",
+      "risk": "The crowded module grid works against calm reading and the user’s stated rejection of dashboard-like density.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "compact source mosaic", "x": 0, "y": 0, "w": 12, "h": 4, "accent": true}, {"label": "reader", "x": 1, "y": 4, "w": 10, "h": 6}]}
+    },
+    {
+      "id": "challenger-labanotation",
+      "label": "Movement Score",
+      "verdict": "declined",
+      "lineage": "Labanotation dance scores",
+      "thesis": "Give continuous reading progress a legible position beside the document.",
+      "palette": ["#f0eee7", "#292824", "#af4838", "#737a72"],
+      "materials": ["parallel columns", "duration marks", "mirrored score staff"],
+      "viewport": "A slim reading-progress staff sits at the page edge; the article stays in ordinary paragraphs and headings.",
+      "case": "Kept: progress should have a visible, continuous position and remain accessible without animation.",
+      "risk": "Dance notation has little connection to saving and reading research sources.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "progress staff", "x": 0, "y": 1, "w": 1, "h": 8}, {"label": "reading document", "x": 2, "y": 1, "w": 8, "h": 8, "accent": true}, {"label": "annotation column", "x": 10, "y": 1, "w": 2, "h": 8}]}
+    },
+    {
+      "id": "challenger-streaming-wall",
+      "label": "Streaming Catalog Wall",
+      "verdict": "declined",
+      "lineage": "Streaming service browse walls",
+      "thesis": "Let one selected source take focus while neighboring shelves recede.",
+      "palette": ["#17191d", "#eeeae1", "#806c8a"],
+      "materials": ["source artwork", "horizontal shelves", "focus expansion"],
+      "viewport": "A selected reading item opens into a text-first view; neighboring source shelves stay one navigation action away.",
+      "case": "Kept: a real source image can help identify a saved item, but it is always secondary to its title and type.",
+      "risk": "Poster tiles imply a video catalog and push reading into a secondary position.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "topic shelf rails", "x": 0, "y": 0, "w": 12, "h": 3, "accent": true}, {"label": "open reading page", "x": 2, "y": 3, "w": 8, "h": 7}]}
+    },
+    {
+      "id": "challenger-cassette",
+      "label": "Cassette J-card",
+      "verdict": "declined",
+      "lineage": "Hand-ruled cassette inlay cards",
+      "thesis": "Keep an ordered list of sources and the reader’s notes together.",
+      "palette": ["#f3f0e8", "#293b49", "#a34a36"],
+      "materials": ["ruled inlay", "spine labels", "folded liner notes"],
+      "viewport": "A reading queue with a compact source spine and an open document area.",
+      "case": "Kept: identity, order, and personal annotation form a durable reading record.",
+      "risk": "An album side metaphor imposes a sequence that mixed-source shelves do not need.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [{"label": "source spine", "x": 0, "y": 0, "w": 2, "h": 10}, {"label": "document panel", "x": 3, "y": 1, "w": 7, "h": 8, "accent": true}, {"label": "notes", "x": 10, "y": 1, "w": 2, "h": 8}]}
+    }
+  ],
+  "reroll": {"registers": ["safer", "bolder"]},
+  "buildPath": {"value": "code", "toggle": true},
+  "canon": true,
+  "canonCard": {
+    "label": "The category standard",
+    "thesis": "A conventional reading library, carefully executed and easy to scan.",
+    "palette": ["#ffffff", "#1f2933", "#356e68"],
+    "materials": ["plain list rows", "clear source tags", "single-purpose controls"],
+    "viewport": "Familiar navigation to saved articles, discovery, notebook, and CVEs; opening an article expands into a focused reader with notes.",
+    "risk": "The clearest route, but the least distinctive visual identity by design."
+  },
+  "steer": true
+}

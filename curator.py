@@ -114,7 +114,10 @@ def trend_score(claps, published):
     age = 30
     if published:
         try:
-            age = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(published)).days)
+            d = datetime.fromisoformat(published)
+            if d.tzinfo is None:  # a bare "2025-01-03" would raise TypeError against an aware now
+                d = d.replace(tzinfo=timezone.utc)
+            age = max(0, (datetime.now(timezone.utc) - d).days)
         except ValueError:
             pass
     return (claps or 0) / (age + 3) ** 0.8

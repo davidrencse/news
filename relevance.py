@@ -12,6 +12,7 @@ Post titles in the index come from the URL slug, so scoring here works on short,
 text. Features are each normalised to 0..1 and combined with the weights below, which is what makes
 the weights readable: doubling W_PHRASE really does make adjacency twice as important.
 """
+import functools
 import math
 import re
 import unicodedata
@@ -57,6 +58,7 @@ def words(text):
     return _WORD.findall(folded)
 
 
+@functools.lru_cache(maxsize=200_000)  # called ~60k times per search on a few thousand distinct words
 def stem(word):
     """A light suffix stripper, close enough to SQLite's porter tokenizer for ranking.
 
@@ -117,7 +119,10 @@ def _as_day(value, today=None):
     rel = _REL_DATE.match(value)
     if rel:
         n, unit = int(rel.group(1)), rel.group(2).lower()
-        return (today - timedelta(days=n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit])).isoformat()
+        try:
+            return (today - timedelta(days=n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit])).isoformat()
+        except OverflowError:  # "since:3000y" reaches before year 1
+            return None
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         return value
     if re.fullmatch(r"\d{4}-\d{2}", value):

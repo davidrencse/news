@@ -10,6 +10,9 @@
 const THREE_SRC = '/static/vendor/three/three.module.min.js';
 const PREF_KEY = 'babelIntro';
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const whenIdle = (callback, timeout) => typeof window.requestIdleCallback === 'function'
+  ? window.requestIdleCallback(callback, { timeout })
+  : setTimeout(callback, timeout);
 
 let THREE = null;
 let world = null;     // scene, built once and reused
@@ -1021,7 +1024,7 @@ function start(a, status, token, vol) {
   const readyWith = () => {
     if (pagesState.article || preparing) return;
     preparing = true;
-    (window.requestIdleCallback || setTimeout)(buildArticle, { timeout: 250 });
+    whenIdle(buildArticle, 250);
   };
   const buildArticle = () => {
     if (stopped) return;
@@ -1253,6 +1256,6 @@ syncButton();
 
 // fetch Three.js while the browser is idle so the first click doesn't wait for it
 // build the library while the browser is idle so the first click starts at once
-if (enabled()) (window.requestIdleCallback || setTimeout)(() => prepare().catch(() => {}), { timeout: 4000 });
+if (enabled()) whenIdle(() => prepare().catch(() => {}), 4000);
 
 window.BabelIntro = { play, enabled, setEnabled, get playing() { return !!active; } };

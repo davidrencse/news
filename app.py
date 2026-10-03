@@ -1,4 +1,4 @@
-"""Medium Library — local server.
+"""Library of Babel — local server.
 
 Run:  .venv\\Scripts\\python app.py   then open http://127.0.0.1:8765
 """
@@ -22,9 +22,12 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 import polite
+import cve_sources
+from cve_catalog import CVECatalog
 from curator import Curator
 from medium_index import MediumIndex
 from pipeline import PdfPipeline, PipelineError
@@ -52,7 +55,7 @@ def choose_data_dir():
         return ROOT
     target = os.path.join(FALLBACK_STORAGE, "medium-library")
     os.makedirs(target, exist_ok=True)
-    for name in ("Medium-Library", "search-index", "notes"):
+    for name in ("Medium-Library", "search-index", "notes", "CVEs"):
         src, dst = os.path.join(ROOT, name), os.path.join(target, name)
         if os.path.exists(src) and not os.path.exists(dst):
             shutil.move(src, dst)
@@ -65,6 +68,8 @@ def choose_data_dir():
 DATA_DIR = choose_data_dir()
 LIBRARY_DIR = os.path.join(DATA_DIR, "Medium-Library")
 DB_PATH = os.path.join(LIBRARY_DIR, "library.json")
+CVE_DB_PATH = os.path.join(DATA_DIR, "CVEs", "cves.json")
+CVE_CATALOG_PATH = os.path.join(DATA_DIR, "CVEs", "cvelistV5.sqlite3")
 STATIC_DIR = os.path.join(ROOT, "static")
 NOTES_DIR = os.path.join(DATA_DIR, "notes")  # highlights + notes per article, kept apart from downloads
 FEED_TTL = 15 * 60
@@ -237,6 +242,47 @@ class Store:
 
 
 store = Store(DB_PATH)
+
+
+class CVEStore:
+    """Separate durable store for vulnerability records; article schema remains unchanged."""
+    def __init__(self, path):
+        self.path, self.lock = path, threading.RLock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("CVE store is not a list")
+            self.records = {x["id"]: x for x in data if isinstance(x, dict) and x.get("id")}
+        except FileNotFoundError:
+            self.records = {}
+        except (OSError, ValueError, TypeError) as exc:
+            backup = f"{path}.broken-{int(time.time())}"
+            try:
+                shutil.copy2(path, backup)
+                print(f"  CVE store could not be read ({type(exc).__name__}: {exc}); kept a copy at {backup}")
+            except OSError:
+                print(f"  CVE store could not be read ({type(exc).__name__}: {exc})")
+            self.records = {}
+
+    def all(self):
+        with self.lock:
+            return sorted((json.loads(json.dumps(x)) for x in self.records.values()),
+                          key=lambda x: x.get("updated") or x.get("published") or "", reverse=True)
+
+    def upsert(self, record):
+        with self.lock:
+            self.records[record["id"]] = record
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(list(self.records.values()), f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+            return json.loads(json.dumps(record))
+
+
+cve_store = CVEStore(CVE_DB_PATH)
+cve_catalog = CVECatalog(CVE_CATALOG_PATH)
 pipeline = PdfPipeline(STATIC_DIR)
 jobs: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()  # the event loop only keeps weak references to running tasks
@@ -352,8 +398,12 @@ def fetch_tag_feed(tag):
             published = parsedate_to_datetime(pub).isoformat() if pub else None
         except Exception:
             published = None
+        try:
+            url = normalize_url(link)
+        except HTTPException:  # one odd <link> shouldn't sink the whole tag
+            continue
         items.append({
-            "url": normalize_url(link),
+            "url": url,
             "title": html.unescape((it.findtext("title") or "").strip()),
             "author": it.findtext("dc:creator", namespaces=NS) or "",
             "published": published,
@@ -464,7 +514,7 @@ async def lifespan(_app):
     store.stop()
 
 
-app = FastAPI(title="Medium Library", lifespan=lifespan)
+app = FastAPI(title="Library of Babel", lifespan=lifespan)
 
 
 class TopicIn(BaseModel):
@@ -497,7 +547,182 @@ def get_library():
     with store.lock:  # the curator threads edit article dicts; copy a consistent snapshot
         topics = json.loads(json.dumps(store.data["topics"]))
         articles = [dict(a) for a in store.data["articles"]]
-    return {"topics": topics, "articles": [public(a) for a in articles], "version": store.version}
+        version = store.version
+    # FastAPI's generic encoder recursively walks every field of every article. A large
+    # link-only library can contain tens of thousands of rows, making that walk dominate
+    # the request. These values are already JSON-compatible, so serialize them once.
+    rows = []
+    for article in articles:
+        row = public(article)
+        if article.get("source") == "bulk":
+            # Index imports have no body, image, or paywall data yet. Omitting their
+            # empty fields saves several MB without changing how the UI reads them.
+            row = {key: value for key, value in row.items() if value is not None and value != ""}
+        rows.append(row)
+    payload = {"topics": topics, "articles": rows, "version": version}
+    return Response(json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    media_type="application/json")
+
+
+# A browse session requests many small pages. Build counts and scope lists once for each Store
+# version so page two and later are O(page size), instead of recounting the full library each time.
+_library_page_cache_lock = threading.Lock()
+_library_page_cache = None
+
+
+def _library_page_index():
+    global _library_page_cache
+    with _library_page_cache_lock:
+        with store.lock:
+            version = store.version
+            if _library_page_cache and _library_page_cache["version"] == version:
+                return _library_page_cache
+            topics = json.loads(json.dumps(store.data["topics"]))
+            articles = [dict(a) for a in store.data["articles"]]
+
+        def bucket():
+            return {"total": 0, "free": 0, "locked": 0, "noted": 0, "subtopics": {}}
+
+        counts = {"total": 0, "free": 0, "locked": 0, "noted": 0, "topics": {}}
+        scopes = {("", ""): {"all": [], "free": [], "locked": []}}
+        for topic in topics:
+            tid = topic["id"]
+            counts["topics"][tid] = bucket()
+            scopes[(tid, "")] = {"all": [], "free": [], "locked": []}
+            for subtopic in topic["subtopics"]:
+                sid = subtopic["id"]
+                counts["topics"][tid]["subtopics"][sid] = bucket()
+                scopes[(tid, sid)] = {"all": [], "free": [], "locked": []}
+
+        for article in articles:
+            tid, sid = article.get("topic", ""), article.get("subtopic", "")
+            topic_counts = counts["topics"].setdefault(tid, bucket())
+            sub_counts = topic_counts["subtopics"].setdefault(sid, bucket())
+            scopes.setdefault((tid, ""), {"all": [], "free": [], "locked": []})
+            scopes.setdefault((tid, sid), {"all": [], "free": [], "locked": []})
+            for target in (counts, topic_counts, sub_counts):
+                target["total"] += 1
+                if article.get("locked") is False:
+                    target["free"] += 1
+                elif article.get("locked") is True:
+                    target["locked"] += 1
+                if article.get("notes_count"):
+                    target["noted"] += 1
+            for scope_key in (("", ""), (tid, ""), (tid, sid)):
+                scope = scopes[scope_key]
+                scope["all"].append(article)
+                if article.get("locked") is False:
+                    scope["free"].append(article)
+                elif article.get("locked") is True:
+                    scope["locked"].append(article)
+
+        _library_page_cache = {"version": version, "topics": topics, "counts": counts, "scopes": scopes}
+        return _library_page_cache
+
+
+@app.get("/api/library/first")
+def get_library_first_page(limit: int = 60, topic_id: str = "", subtopic_id: str = "", access: str = "all"):
+    """Return the first screen without waiting for the full-library counts index."""
+    limit = max(1, min(limit, 100))
+    access = access if access in ("all", "free", "locked") else "all"
+    if subtopic_id and not topic_id:
+        raise HTTPException(400, "A topic is required with a subtopic.")
+    with store.lock:
+        topics = json.loads(json.dumps(store.data["topics"]))
+        articles = tuple(store.data["articles"])
+        version = store.version
+    selected = []
+    for article in articles:
+        if topic_id and article.get("topic") != topic_id:
+            continue
+        if subtopic_id and article.get("subtopic") != subtopic_id:
+            continue
+        if access == "free" and article.get("locked") is not False:
+            continue
+        if access == "locked" and article.get("locked") is not True:
+            continue
+        selected.append(article)
+        if len(selected) >= limit:
+            break
+    rows = []
+    for article in selected:
+        row = public(article)
+        if article.get("source") == "bulk":
+            row = {key: value for key, value in row.items() if value is not None and value != ""}
+        rows.append(row)
+    return {"topics": topics, "articles": rows, "version": version}
+
+
+@app.get("/api/library/page")
+def get_library_page(offset: int = 0, limit: int = 60, topic_id: str = "", subtopic_id: str = "", access: str = "all"):
+    """Small browse payload backed by a versioned index of counts and article scopes."""
+    offset = max(0, min(offset, 1_000_000))
+    limit = max(1, min(limit, 100))
+    access = access if access in ("all", "free", "locked") else "all"
+    if subtopic_id and not topic_id:
+        raise HTTPException(400, "A topic is required with a subtopic.")
+    index = _library_page_index()
+    topics, counts, version = index["topics"], index["counts"], index["version"]
+    scope = index["scopes"].get((topic_id, subtopic_id), {"all": [], "free": [], "locked": []})
+    selected_scope = scope[access]
+    total = len(selected_scope)
+    selected = [dict(article) for article in selected_scope[offset:offset + limit]]
+
+    rows = []
+    for article in selected:
+        row = public(article)
+        if article.get("source") == "bulk":
+            row = {key: value for key, value in row.items() if value is not None and value != ""}
+        rows.append(row)
+    return {"topics": topics, "articles": rows, "counts": counts, "total": total,
+            "offset": offset, "limit": limit, "version": version}
+
+
+@app.get("/api/library/search")
+def search_saved_library(q: str = "", limit: int = 20):
+    """Search saved article metadata without sending the full library to the browser."""
+    q = q.strip().lower()
+    if not q:
+        return {"items": [], "total": 0}
+    limit = max(1, min(limit, 100))
+    phrases, plain, minus = [], [], []
+    for token in re.findall(r'-?"[^\"]*"|\S+', q):
+        neg = token.startswith("-")
+        body = (token[1:] if neg else token).strip('"')
+        words = re.findall(r"[a-z0-9]+", body)
+        if neg:
+            minus.extend(words)
+        elif len(words) > 1 and token.lstrip("-").startswith('"'):
+            phrases.append(" ".join(words))
+        else:
+            plain.extend(words)
+    words = [*plain, *(word for phrase in phrases for word in phrase.split())]
+    if not words:
+        return {"items": [], "total": 0}
+    with store.lock:
+        articles = tuple(store.data["articles"])
+    scored = []
+    for article in articles:
+        title = (article.get("title") or "").lower()
+        rest = " ".join((article.get("author") or "", article.get("snippet") or "",
+                         article.get("topic") or "", article.get("subtopic") or "")).lower()
+        if any(word in title or word in rest for word in minus):
+            continue
+        if any(phrase not in title and phrase not in rest for phrase in phrases):
+            continue
+        in_title = sum(word in title for word in words)
+        anywhere = sum(word in title or word in rest for word in words)
+        if not anywhere:
+            continue
+        order = [title.find(word) for word in plain if word in title]
+        span = max(order) - min(order) + 1 if len(order) > 1 else 1
+        score = (2.5 * anywhere / len(words) + 1.2 * in_title / len(words)
+                 + 0.6 * (len(order) / span if len(order) > 1 else 0)
+                 + 0.5 * sum(phrase in title for phrase in phrases)
+                 + 0.3 * bool(article.get("fetched")))
+        scored.append((score, article.get("added") or "", article))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return {"items": [public(article) for _, _, article in scored[:limit]], "total": len(scored)}
 
 
 @app.post("/api/topics")
@@ -542,9 +767,9 @@ def delete_subtopic(tid: str, sid: str):
         raise HTTPException(400, "Built-in subtopics can't be deleted.")
     with store.lock:
         t["subtopics"].remove(sub)
-        # articles are unfiled rather than lost; their PDFs stay on disk
+        # the subtopic's articles go with it, files included, so nothing is left orphaned on disk
         for a in [a for a in store.data["articles"] if a["topic"] == tid and a["subtopic"] == sid]:
-            store.discard(a)
+            remove_article(a)
         store.save()
     folder = os.path.join(LIBRARY_DIR, tid, sid)
     if os.path.isdir(folder) and not os.listdir(folder):
@@ -595,7 +820,8 @@ async def recommend(labels: str = "", access: str = "all", limit: int = 60):
     """Posts picked for you from what you've read. labels: comma-separated Medium tags to narrow to."""
     include_locked = {"free": False, "locked": True}.get(access)
     res = await asyncio.to_thread(recommender.recommend, labels.split(","), max(1, min(limit, 300)), include_locked)
-    res["items"] = [dict(it, id=article_id(it["url"])) for it in res["items"]]
+    res["items"] = [dict(it, id=article_id(it["url"]), saved=store.by_url(it["url"]) is not None)
+                     for it in res["items"]]
     res["labels"] = await asyncio.to_thread(recommender.all_labels)
     return res
 
@@ -644,6 +870,73 @@ async def search_medium(q: str = "", next: str | None = None):
     return {"q": q, "items": items, "next": json.dumps(res["next"]) if res["next"] else None,
             "provider": res["provider"], "notice": res["notice"], "index": res["index"],
             "parsed": res["parsed"]}
+
+
+class CVEImportIn(BaseModel):
+    cve_id: str
+
+
+@app.get("/api/cves")
+def list_cves():
+    return {"items": cve_store.all(), "sources": list(cve_sources.SOURCES)}
+
+
+@app.get("/api/cves/catalog/status")
+def cve_catalog_status():
+    return cve_catalog.status()
+
+
+@app.get("/api/cves/catalog/search")
+def search_cve_catalog(q: str = "", year: int | None = None, limit: int = 40, offset: int = 0):
+    if year is not None and (year < 1999 or year > datetime.now(timezone.utc).year + 2):
+        raise HTTPException(400, "Choose a valid CVE year.")
+    try:
+        return cve_catalog.search(q, year, limit, offset)
+    except (ValueError, OverflowError):
+        raise HTTPException(400, "Invalid catalog search options.")
+
+
+@app.get("/api/cves/catalog/{cve_id}")
+def get_cve_catalog_record(cve_id: str):
+    if not cve_sources.CVE_RE.fullmatch(cve_id):
+        raise HTTPException(400, "Enter a valid CVE identifier.")
+    record = cve_catalog.get(cve_id)
+    if not record:
+        raise HTTPException(404, "This CVE is not in the local CVE List V5 catalog yet.")
+    return record
+
+
+@app.post("/api/cves/catalog/sync")
+def sync_cve_catalog():
+    if not cve_catalog.start_sync():
+        return {"started": False, "status": cve_catalog.status()}
+    return {"started": True, "status": cve_catalog.status()}
+
+
+@app.post("/api/cves/import")
+async def import_cve(body: CVEImportIn):
+    """Enrich a CVE from public catalogs and upsert it into the local CVE library."""
+    try:
+        record = await asyncio.to_thread(cve_sources.enrich, body.cve_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+    record["saved_at"] = now_iso()
+    return cve_store.upsert(record)
+
+
+@app.delete("/api/cves/{cve_id}")
+def remove_cve(cve_id: str):
+    cve_id = cve_id.upper()
+    with cve_store.lock:
+        if not cve_store.records.pop(cve_id, None):
+            raise HTTPException(404, "CVE not found in your library.")
+        tmp = cve_store.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(cve_store.records.values()), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, cve_store.path)
+    return {"ok": True}
 
 
 class IndexSettings(BaseModel):
@@ -701,7 +994,7 @@ def create_article(fields):
 
 
 def downloading(aid):
-    return any(j["article_id"] == aid and j["status"] == "running" for j in jobs.values())
+    return any(j["article_id"] == aid and j["status"] == "running" for j in list(jobs.values()))
 
 
 def remove_article(a):
@@ -766,7 +1059,7 @@ def delete_article(aid: str):
 def prune_jobs():
     """Drop finished jobs the UI has had its chance to read, so a long session doesn't grow forever."""
     cutoff = time.time() - JOB_TTL
-    for jid in [j["id"] for j in jobs.values() if j["status"] != "running" and j["started"] < cutoff]:
+    for jid in [j["id"] for j in list(jobs.values()) if j["status"] != "running" and j["started"] < cutoff]:
         jobs.pop(jid, None)
 
 
@@ -939,6 +1232,24 @@ async def cache_headers(request, call_next):
     return response
 
 
+class Compress:
+    """gzip text responses (JS, CSS, JSON, article HTML) — the vendor libraries alone are ~1 MB raw
+    over Wi-Fi to a phone. PDFs are already compressed, and a byte-range reply must not be re-encoded,
+    so those pass straight through."""
+
+    def __init__(self, app):
+        self.app, self.gzip = app, GZipMiddleware(app, minimum_size=1024, compresslevel=1)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers") or [])
+            if b"range" not in headers and not scope["path"].endswith(".pdf"):
+                return await self.gzip(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+app.add_middleware(Compress)
+
 app.mount("/files", StaticFiles(directory=LIBRARY_DIR), name="files")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -987,7 +1298,7 @@ if __name__ == "__main__":
     # network can read it. Set HOST=127.0.0.1 to keep it to this machine.
     host = os.environ.get("HOST", "0.0.0.0")
     lan = lan_address() if host == "0.0.0.0" else None
-    print(f"\n  Medium Library -> http://127.0.0.1:{port}")
+    print(f"\n  Library of Babel -> http://127.0.0.1:{port}")
     if lan:
         print(f"  On your phone    -> http://{lan}:{port}   (same Wi-Fi; anyone on it can read your library)")
         print("  In Safari, tap Share -> Add to Home Screen to install it as an app.")

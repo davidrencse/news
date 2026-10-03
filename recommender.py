@@ -144,7 +144,9 @@ class Recommender:
 
         taste = Taste()
         for a in arts:
-            weight, when = self._engagement(a, _has_notes(self.notes_path(a["id"])))
+            # put_notes keeps notes_count on the row; only rows from before that field need the file
+            has = a["notes_count"] > 0 if "notes_count" in a else _has_notes(self.notes_path(a["id"]))
+            weight, when = self._engagement(a, has)
             if not weight:
                 continue
             taste.engaged += 1

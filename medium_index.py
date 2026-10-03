@@ -149,13 +149,27 @@ class MediumIndex:
                 self.state["error"] = None
             except urllib.error.HTTPError as e:
                 self.state["error"] = f"Medium answered HTTP {e.code}; waiting before retrying"
+                if e.code not in (429, 503):
+                    self._give_up_after_retries(day, url, lastmod)
                 self._sleep(300 if e.code in (429, 503) else 60)
                 continue
             except Exception as e:
                 self.state["error"] = f"{type(e).__name__}: {e}"
+                self._give_up_after_retries(day, url, lastmod)
                 self._sleep(60)
                 continue
             self._sleep(REQUEST_GAP)
+
+    def _give_up_after_retries(self, day, url, lastmod, limit=3):
+        """The newest pending day is always retried first, so one day that fails every time would stall
+        the whole crawl. After a few tries it is recorded as crawled with no posts and the crawl moves on."""
+        fails = self.__dict__.setdefault("_fails", {})  # day -> consecutive failures
+        fails[day] = fails.get(day, 0) + 1
+        if fails[day] >= limit:
+            fails.pop(day)
+            with self._db() as c:
+                c.execute("INSERT OR REPLACE INTO sitemaps VALUES (?, ?, ?, ?)",
+                          (day, lastmod, 0, datetime.now(timezone.utc).isoformat(timespec="seconds")))
 
     def _pending(self):
         if not self._sitemaps or time.time() - self._sitemaps_at > INDEX_REFRESH:
@@ -187,8 +201,11 @@ class MediumIndex:
                     continue
                 prio = re.search(r"<priority>([\d.]+)</priority>", block)
                 kept += 1
-                cur = c.execute("INSERT OR IGNORE INTO posts(url, day, prio) VALUES (?, ?, ?)",
-                                (loc, day, float(prio.group(1)) if prio else 0.2))
+                try:
+                    p = float(prio.group(1)) if prio else 0.2
+                except ValueError:  # "." or "1.0.0" matches the pattern but isn't a number
+                    p = 0.2
+                cur = c.execute("INSERT OR IGNORE INTO posts(url, day, prio) VALUES (?, ?, ?)", (loc, day, p))
                 if cur.rowcount:
                     c.execute("INSERT INTO posts_fts(rowid, title, author) VALUES (?, ?, ?)",
                               (cur.lastrowid, title, author_of(loc)))
