@@ -20,6 +20,8 @@ const SHELL_URLS = [
   '/static/style.css',
   '/static/article.css',
   '/static/app.js',
+  '/static/briefing.js',
+  '/static/briefing.css',
   '/static/babel.js',
   '/static/article.js',
   '/static/manifest.webmanifest',
@@ -120,7 +122,7 @@ self.addEventListener('fetch', e => {
     return;
   }
   // The paged library is the boot payload now; cache its first page as the offline shelf view.
-  if (url.pathname === '/api/library' || url.pathname === '/api/library/page') {
+  if (url.pathname === '/api/library' || url.pathname === '/api/library/first' || url.pathname === '/api/library/page') {
     e.respondWith(networkFirst(req, DATA));
     return;
   }

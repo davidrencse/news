@@ -282,6 +282,33 @@ def test_performance_guardrails():
     rec.recommend(["malware"], 30)
     check("a library change invalidates recommendation reuse", len(calls) == 2, len(calls))
 
+    class CountedRows(list):
+        visited = 0
+
+        def __iter__(self):
+            for row in super().__iter__():
+                self.visited += 1
+                yield row
+
+    # Initial load should stop at the requested page, even when the library is large.
+    counted = CountedRows(dict(id=f"first-{i}", title=f"First {i}", topic="science",
+                               subtopic="physics", locked=bool(i % 2)) for i in range(10_000))
+    with A.store.lock:
+        previous = A.store.data["articles"]
+        A.store.data["articles"] = counted
+        try:
+            page = A.get_library_first_page(60)
+            check("initial library loading visits only the first page", counted.visited == 60, counted.visited)
+            counted.visited = 0
+            filtered = A.get_library_first_page(10, "science", "physics", "locked")
+            check("initial page filters stop once enough matching articles are found",
+                  counted.visited == 20 and len(filtered["articles"]) == 10
+                  and all(a["locked"] for a in filtered["articles"]), counted.visited)
+            counted[0]["title"] = "changed after response"
+            check("initial page returns a stable article snapshot", page["articles"][0]["title"] == "First 0")
+        finally:
+            A.store.data["articles"] = previous
+
     # Paged browsing should reuse its precomputed scope/count index between page requests.
     probe = A.create_article({"url": "https://medium.com/@a/page-index-probe-7f7f7f7f7f7f",
                               "topic": "cybersecurity", "subtopic": "malware", "title": "Page index probe"})
@@ -299,6 +326,14 @@ def test_performance_guardrails():
     check("paged library results advance without rescanning into duplicate rows",
           first_page["articles"][0]["id"] != second_page["articles"][0]["id"],
           [x["id"] for x in first_page["articles"] + second_page["articles"]])
+    probe["locked"] = True
+    probe["notes_count"] = 0
+    A.store.save()
+    changed = A.get_library_page(0, 100, "cybersecurity", "malware", "locked")
+    check("library index invalidates after access and note changes",
+          A._library_page_cache is not index_ref
+          and any(a["id"] == probe["id"] for a in changed["articles"])
+          and changed["counts"]["noted"] == expected_noted - 1)
     A.store.discard(probe)
     A.store.discard(probe2)
 
@@ -590,19 +625,20 @@ def test_pipeline_parallel_downloads():
     if not BROWSER:
         return
     import asyncio
-    urls = [f"https://medium.com/@a/parallel-{i}-70707070707{i}" for i in range(4)]
+    count = _pipeline.MAX_PARALLEL * 2  # exercise both active jobs and semaphore waiters
+    urls = [f"https://medium.com/@a/parallel-{i}-{0x707070707070 + i:012x}" for i in range(count)]
     for i, u in enumerate(urls):
-        PAGES[u] = post_page(f"70707070707{i}", f"Parallel {i}", tags=("cybersecurity", "malware"))
+        PAGES[u] = post_page(f"{0x707070707070 + i:012x}", f"Parallel {i}", tags=("cybersecurity", "malware"))
 
     async def run():
-        A.pipeline._browser = None  # force a cold start, so all four race to launch
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(A.pipeline._drop_browser(), A.pipeline._loop))
         return await asyncio.gather(*(A.pipeline.render(u, os.path.join(WORK, f"par{i}"))
                                       for i, u in enumerate(urls)))
 
     metas = asyncio.run(asyncio.wait_for(run(), 300))
-    check("every parallel download finishes", len(metas) == 4 and all(m["title"].startswith("Parallel") for m in metas))
+    check("every parallel download finishes", len(metas) == count and all(m["title"].startswith("Parallel") for m in metas))
     check("they all produced a PDF",
-          all(os.path.exists(os.path.join(WORK, f"par{i}", "article.pdf")) for i in range(4)))
+          all(os.path.exists(os.path.join(WORK, f"par{i}", "article.pdf")) for i in range(count)))
     check("only one browser is left running", A.pipeline._browser is not None and A.pipeline._browser.is_connected())
 
 
@@ -751,6 +787,8 @@ def test_phone_ui():
             out["first_render_seconds"] = time.perf_counter() - started
             out["cves_deferred"] = not any(url.endswith("/api/cves") for url in requests)
             first_card = await page.locator(".card").first.evaluate_handle("el => el")
+            await page.evaluate("refreshLibraryMeta()")
+            out["metadata_keeps_existing_cards"] = await first_card.evaluate("el => el.isConnected")
             out["first_page_count"] = await page.locator(".card").count()
             out["library_count"] = await page.evaluate("S.articles.length")
             if await page.locator("#showMore").count():
@@ -835,6 +873,7 @@ def test_phone_ui():
     check("the library's first cards render within the local-load budget",
           r["first_render_seconds"] < 8.0, f"{r['first_render_seconds']:.2f}s (budget 8s)")
     check("opening the library defers the saved CVE payload", r["cves_deferred"])
+    check("refreshing library counts preserves rendered cards", r["metadata_keeps_existing_cards"])
     check("the first library page stays capped at 60 cards", r["first_page_count"] == 60,
           r["first_page_count"])
     check("show more appends the next page without rebuilding earlier cards",
@@ -982,8 +1021,8 @@ def test_offline_reading():
                    }""")
             out["app_js_cached"] = any("/static/app.js?v=" in u for u in cached)
             out["article_cached"] = any("/content.html" in u for u in cached)
-            out["paged_library_cached"] = any("/api/library/page?" in u for u in cached)
-            out["paged_library_urls"] = [u for u in cached if "/api/library/page" in u]
+            out["paged_library_cached"] = any("/api/library/first?" in u and "limit=60" in u for u in cached)
+            out["paged_library_urls"] = [u for u in cached if "/api/library/first" in u or "/api/library/page" in u]
             out["one_app_js"] = sum("/static/app.js" in u for u in cached) <= 2  # bare + one stamp
 
             # the PDF viewer asks for byte ranges; a 206 is a slice, and caching one corrupts the file
@@ -1010,6 +1049,10 @@ def test_offline_reading():
             out["offline_list_message"] = await page.locator("#list").inner_text()
             out["offline_cached_page_rows"] = await page.evaluate(
                 "fetch('/api/library/page?offset=0&limit=60&access=all').then(r => r.json()).then(d => d.articles.length).catch(() => -1)")
+            out["offline_cached_page_with_api_headers"] = await page.evaluate(
+                "caches.match(new Request('/api/library/page?offset=0&limit=60&access=all', {headers:{'Content-Type':'application/json'}})).then(r => !!r)")
+            out["offline_page_controller"] = await page.evaluate("!!navigator.serviceWorker.controller")
+            out["offline_current_library_url"] = await page.evaluate("libraryPageUrl()")
             if await page.locator(".card-title").count():
                 await page.click(".card-title")
                 await page.wait_for_selector("#doc", timeout=20000)
@@ -1050,7 +1093,7 @@ def test_offline_reading():
     check("the app still loads with no network", r["offline_app_loads"])
     check("the library list survives offline", r["offline_has_articles"], r.get("offline_list_message"))
     check("the cards render offline", r["offline_renders_cards"],
-          (r.get("offline_list_message"), r.get("offline_cached_page_rows"), r.get("paged_library_urls")))
+          (r.get("offline_list_message"), r.get("offline_cached_page_rows"), r.get("offline_cached_page_with_api_headers"), r.get("offline_page_controller"), r.get("offline_current_library_url"), r.get("paged_library_urls")))
     check("a saved article still opens offline", r["offline_article_opens"])
     check("and its text is there", r["offline_article_has_text"])
     check("it still loads offline after an app update changed every asset URL", r["offline_after_update"])
@@ -1091,6 +1134,7 @@ def test_notes_survive_backgrounding():
         time.sleep(0.1)
 
     typed = "A note typed right before the app went away"
+    reading_checks = {}
 
     async def drive():
         pw = await async_playwright().start()
@@ -1098,10 +1142,25 @@ def test_notes_survive_backgrounding():
                                               if _pipeline.CHROMIUM_PATH else {}))
         ctx = await browser.new_context()
         page = await ctx.new_page()
+        notes_requested = asyncio.Event()
+        release_notes = asyncio.Event()
+
+        async def hold_notes(route):
+            if route.request.method == "GET":
+                notes_requested.set()
+                await release_notes.wait()
+            await route.continue_()
+
+        await page.route("**/api/articles/*/notes", hold_notes)
         try:
             await page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
             await page.click(".card-title")
-            await page.wait_for_selector("#doc", timeout=20000)
+            await asyncio.wait_for(notes_requested.wait(), 10)
+            await page.wait_for_selector("#doc", timeout=5000)
+            reading_checks["text_before_notes"] = "A heading" in await page.inner_text("#doc")
+            reading_checks["editing_waits_for_notes"] = await page.evaluate("R.article === null")
+            release_notes.set()
+            await page.wait_for_function("R.article !== null")
             await page.wait_for_timeout(600)
             if not await page.is_visible("#freeNotes"):
                 await page.click("#readerNotes")
@@ -1117,6 +1176,7 @@ def test_notes_survive_backgrounding():
             await page.close(run_before_unload=False)  # the tab is reclaimed; no beforeunload
             await asyncio.sleep(1.5)
         finally:
+            release_notes.set()
             await ctx.close()
             await browser.close()
             await pw.stop()
@@ -1128,6 +1188,8 @@ def test_notes_survive_backgrounding():
 
     path = A.notes_path(a["id"])
     saved = json.load(open(path, encoding="utf-8"))["notes"] if os.path.exists(path) else None
+    check("saved article text appears before a slow notes response", reading_checks.get("text_before_notes"))
+    check("editing waits for existing notes to load", reading_checks.get("editing_waits_for_notes"))
     check("a note typed just before the app is backgrounded still reaches the server",
           saved == typed, repr(saved))
     A.store.discard(a)
@@ -1306,6 +1368,79 @@ def test_next_subtopic_targets():
     check("the curator picks a subtopic to fill", filling and cap >= C.CAP, f"{tid}/{sub['id']} cap={cap}")
     check("the cap reflects the topic target", cap * 15 >= C.TOPIC_TARGET, f"cap={cap}")
     check("the topic target leaves room for 1,000 more per area", C.TOPIC_TARGET >= 1120, C.TOPIC_TARGET)
+
+
+def test_morning_briefing():
+    """Exercise the real briefing API and desktop/mobile view against dated news fixtures."""
+    import socket
+    import threading
+    import uvicorn
+    from unittest.mock import patch
+    from briefing import BriefingService
+    from test_briefing import fixture_fetch
+
+    def fetch(*args):
+        time.sleep(0.02)
+        return fixture_fetch(*args)
+
+    service = BriefingService(fetch)
+    with patch.object(A, "briefing_service", service):
+        client = TestClient(A.app)
+        check("briefing starts idle", client.get("/api/briefing").json()["state"] == "idle")
+        check("briefing rejects unsupported windows", client.post("/api/briefing", json={"days": 99}).status_code == 422)
+        if not BROWSER:
+            response = client.post("/api/briefing", json={"days": 3})
+            check("briefing API accepts a scan", response.status_code == 202)
+            for _ in range(100):
+                if service.snapshot()["state"] != "running":
+                    break
+                time.sleep(0.02)
+            check("briefing API produces five picks", len(service.snapshot()["articles"]) == 5)
+            service.stop()
+            return
+        from playwright.sync_api import sync_playwright
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(A.app, host="127.0.0.1", port=port, log_level="error", lifespan="off"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            for _ in range(100):
+                if server.started:
+                    break
+                time.sleep(0.05)
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(**({"executable_path": _pipeline.CHROMIUM_PATH} if _pipeline.CHROMIUM_PATH else {}))
+                try:
+                    page = browser.new_page(viewport={"width": 1360, "height": 1000})
+                    page.goto(f"http://127.0.0.1:{port}")
+                    page.locator('[data-briefing]').click()
+                    page.locator('.briefing-picks .briefing-story').first.wait_for(timeout=20000)
+                    check("briefing shows exactly five reading picks", page.locator('.briefing-picks .briefing-story').count() == 5)
+                    check("briefing reports all 60 scanned topics", "60 of 60 topics checked" in page.locator('.briefing-edition').inner_text())
+                    page.get_by_text('See the top 10 shortlist', exact=True).click()
+                    check("briefing exposes its ten-article shortlist", page.locator('.briefing-story-compact').count() == 10)
+                    page.get_by_text('See the top 10 shortlist', exact=True).click()
+                    check("briefing links open safely", page.locator('.briefing-picks h2 a').first.get_attribute('rel') == 'noopener noreferrer')
+                    page.screenshot(path=os.path.join(tempfile.gettempdir(), 'newsletter-briefing-desktop.png'), full_page=True)
+                    page.locator('#briefingDays').select_option('7')
+                    page.get_by_role('button', name='Generate briefing', exact=True).click()
+                    page.get_by_role('button', name='Generate briefing', exact=True).wait_for(timeout=20000)
+                    check("briefing window selection reaches the API", service.snapshot()['days'] == 7)
+                    page.set_viewport_size({"width": 390, "height": 844})
+                    check("briefing fits a phone viewport", page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                    check("briefing generation button remains visible on a phone", page.get_by_role('button', name='Generate briefing', exact=True).is_visible())
+                    page.screenshot(path=os.path.join(tempfile.gettempdir(), 'newsletter-briefing-mobile.png'), full_page=True)
+                    page.locator('#menuBtn').click()
+                    page.locator('[data-t=""][data-s=""]').click()
+                    check("briefing can return to the library", page.locator('h1').inner_text() == 'All articles')
+                finally:
+                    browser.close()
+        finally:
+            service.stop()
+            server.should_exit = True
+            thread.join(5)
 
 
 def main():

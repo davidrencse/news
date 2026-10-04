@@ -106,7 +106,7 @@ async function load() {
   S.libVersion = data.version;
   S.libraryLoading = false;
   render();
-  refreshLibraryMeta();
+  requestAnimationFrame(() => setTimeout(() => { refreshLibraryMeta(); refreshIndex(); }, 0));
 }
 
 async function loadLibraryPage(append = false) {
@@ -156,7 +156,11 @@ async function refreshLibraryMeta() {
     S.libraryTotal = data.total;
     S.libVersion = data.version;
     renderTree();
-    if (S.mode === 'browse' && S.tab === 'library') { renderHead(); renderList(); }
+    if (S.mode === 'browse' && S.tab === 'library') {
+      renderHead();
+      $('#showMore')?.parentElement.remove();
+      renderMoreButton(S.libraryTotal - S.articles.length);
+    }
   } catch {}
 }
 
@@ -185,6 +189,8 @@ function renderTree() {
     <span class="label">✎ Notebook</span><span class="count">${fmtCount(S.libraryCounts.noted) || ''}</span></button>
     <button class="tree-item tree-all tree-cves ${S.mode === 'cves' ? 'active' : ''}" data-cves>
     <span class="label">Vulnerabilities</span><span class="count">${S.cveCatalog.count ? fmtCount(S.cveCatalog.count) : S.cves.length || ''}</span></button>`;
+  h += `<button class="tree-item tree-all ${S.mode === 'briefing' ? 'active' : ''}" data-briefing>
+    <span class="label">Morning briefing</span></button>`;
   for (const t of S.topics) {
     const open = S.open.has(t.id);
     h += `<div class="${open ? 'open' : ''}" data-group="${esc(t.id)}">
@@ -201,6 +207,7 @@ function renderTree() {
 }
 
 $('#tree').addEventListener('click', e => {
+  if (e.target.closest('[data-briefing]')) return openBriefing();
   const add = e.target.closest('[data-add]');
   if (add) return newTopic(add.dataset.add);
   if (e.target.closest('[data-discover-all]')) return openDiscover();
@@ -445,11 +452,20 @@ document.addEventListener('keydown', e => {
   $('#search').focus();
   $('#search').select();
 });
-$('#themeBtn').onclick = () => {
+$('#themeBtn').onclick = (e) => {
   const root = document.documentElement;
   const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
-  root.dataset.theme = dark ? 'light' : 'dark';
-  local.set('theme', root.dataset.theme);
+  const next = dark ? 'light' : 'dark';
+  const swap = () => { root.dataset.theme = next; local.set('theme', next); };
+  // Skiper4-style circular reveal of the new theme, centred on the toggle
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!document.startViewTransition || reduce) return swap();
+  const r = e.currentTarget.getBoundingClientRect();
+  root.style.setProperty('--vt-x', `${r.left + r.width / 2}px`);
+  root.style.setProperty('--vt-y', `${r.top + r.height / 2}px`);
+  // the theme still swaps inside the callback; ignore an aborted transition
+  // (rapid re-toggle, or the tab hidden mid-reveal) so it never rejects loudly
+  document.startViewTransition(swap).finished.catch(() => {});
 };
 
 function currentDest() {
@@ -466,6 +482,7 @@ function renderDest() { $('#pasteDest').innerHTML = destOptions(currentDest()); 
 
 /* ------------------------------------------------------------ header */
 function renderHead() {
+  if (S.mode === 'briefing') return renderBriefingHead();
   if (S.mode === 'cves') return renderCveHead();
   if (S.mode === 'search') return renderSearchHead();
   if (S.mode === 'discover') return renderDiscoverHead();
@@ -561,6 +578,7 @@ function libraryCard(a, showLoc) {
 }
 
 function renderList() {
+  if (S.mode === 'briefing') return renderBriefingList();
   if (S.mode === 'cves') return renderCves();
   if (S.mode === 'search') return renderSearch();
   if (S.mode === 'discover') return renderDiscoverAll();
@@ -1184,7 +1202,6 @@ async function indexSettings() {
   } catch (err) { toast(err.message); }
 }
 
-refreshIndex();
 setInterval(() => { if (!document.hidden) refreshIndex(); }, 8000);
 
 /* ------------------------------------------------------------ paste link */
@@ -1207,7 +1224,7 @@ const setProgress = pct => { const bar = $('#readProgress'); if (bar) bar.style.
 function openReader(a, force = false) {
   saveNotes(); closePop(); hideSelTools();
   S.reader = a;
-  if (!force) window.BabelIntro?.play(a, readerState(a), { topicName: [topic(a.topic)?.name, sub(a.topic, a.subtopic)?.name].filter(Boolean).join(' · ') });
+  if (!force && !a.doc_url) window.BabelIntro?.play(a, readerState(a), { topicName: [topic(a.topic)?.name, sub(a.topic, a.subtopic)?.name].filter(Boolean).join(' · ') });
   if (!force) api(`/api/articles/${a.id}/read`, { method: 'POST' }).catch(() => {});
   $('#reader').hidden = false;
   $('#readerOriginal').href = safeUrl(a.url);
@@ -1374,18 +1391,19 @@ const docRoot = () => (R.article ? $('#doc') : null);
 async function showDoc(a) {
   closePop(); hideSelTools();
   R.article = null;
-  $('#readerNotes').hidden = false;
+  $('#readerNotes').hidden = true;
   $('#readerBody').innerHTML = `<div class="reading">
     <div class="doc-scroll" id="docScroll"><div class="loading" style="text-align:center">Opening…</div></div>
     <aside class="notes-panel" id="notesPanel" ${local.get('notesOpen', false) ? '' : 'hidden'}></aside>
   </div>`;
-  let content, notes;
+  // Fetch notes alongside the document, but show the text as soon as it arrives.
+  // Editing stays disabled until the saved notes have loaded, avoiding accidental overwrites.
+  const notesPromise = api(`/api/articles/${a.id}/notes`).catch(() => ({ notes: '', summary: '', highlights: [] }));
+  let content;
   try {
-    [content, notes] = await Promise.all([
-      fetch(a.doc_url).then(r => { if (!r.ok) throw new Error(r.statusText); return r.text(); }),
-      api(`/api/articles/${a.id}/notes`).catch(() => ({ notes: '', summary: '', highlights: [] })),
-    ]);
+    content = await fetch(a.doc_url).then(r => { if (!r.ok) throw new Error(r.statusText); return r.text(); });
   } catch (err) {
+    if (S.reader?.id !== a.id) return;
     $('#docScroll').innerHTML = `<div class="empty"><b>Couldn't open the saved copy</b>${esc(err.message)}</div>`;
     return;
   }
@@ -1401,7 +1419,10 @@ async function showDoc(a) {
   });
   doc.querySelectorAll('a[href]').forEach(link => { link.target = '_blank'; link.rel = 'noopener noreferrer'; });
   ArticleDoc.render(doc);
+  const notes = await notesPromise;
+  if (S.reader?.id !== a.id || $('#doc') !== doc) return;
   R.article = a;
+  $('#readerNotes').hidden = false;
   R.notes = { notes: notes.notes || '', summary: notes.summary || '', highlights: Array.isArray(notes.highlights) ? notes.highlights : [] };
   R.dirty = false;
   applyAllHighlights();

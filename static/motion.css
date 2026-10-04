@@ -1,0 +1,103 @@
+/* Motion layer — Framer-like entrances and Skiper-adapted interactions.
+   Loaded last so it re-animates the quiet base from reading-refresh.css.
+   Everything here is progressive: content is fully visible without it, and
+   the global prefers-reduced-motion rule (reading-refresh.css) zeroes it out.
+   Skiper UI (free tier) inspired the theme-toggle reveal (skiper4) and the
+   underline wipe (skiper40); both are reimplemented in native CSS/SVG.
+   Credit: Skiper UI — https://skiper-ui.com (free components, attribution). */
+:root {
+  /* overshoot spring for entrances and the active-nav marker */
+  --m-spring: linear(0, 0.009, 0.035 2.1%, 0.141 4.4%, 0.723 12.9%, 0.938 16.7%,
+    1.017, 1.077 21%, 1.121, 1.149 24.3%, 1.159, 1.163, 1.161, 1.154 29.9%,
+    1.129 32.8%, 1.051 39.6%, 1.017 43.1%, 0.991, 0.977 51%, 0.975 57.1%,
+    0.997 69.8%, 1.003 76.9%, 1);
+  /* crisp ease-out for underline wipes and hover lifts */
+  --m-ease: cubic-bezier(.22, .61, .36, 1);
+}
+
+/* ---- Framer-style list entrance: fade + rise, staggered -------------------- */
+@keyframes m-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+
+.list > .card,
+.list > .cve-card,
+.list > .nb-entry {
+  animation: m-rise .5s var(--m-spring) both;
+}
+/* first few items cascade; later and "show more" items land immediately */
+.list > :nth-child(1) { animation-delay: 0s; }
+.list > :nth-child(2) { animation-delay: .045s; }
+.list > :nth-child(3) { animation-delay: .09s; }
+.list > :nth-child(4) { animation-delay: .135s; }
+.list > :nth-child(5) { animation-delay: .18s; }
+.list > :nth-child(6) { animation-delay: .225s; }
+.list > :nth-child(7) { animation-delay: .27s; }
+.list > :nth-child(8) { animation-delay: .315s; }
+.list > :nth-child(n+9) { animation-delay: 0s; }
+
+/* the home intro and view head settle in too, so a mode switch feels composed */
+.view-head, .home-intro { animation: m-rise .45s var(--m-ease) both; }
+
+/* ---- Skiper40 underline wipe: enters from the left, exits to the right ----- */
+.card-title, .home-source > span, .nb-title, .tab, .tree-item > span:first-child {
+  position: relative;
+}
+.card-title::after,
+.home-source > span::after,
+.nb-title::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -3px; height: 1.5px;
+  background: currentColor; transform: scaleX(0); transform-origin: right;
+  transition: transform .4s var(--m-ease);
+}
+.card:hover .card-title::after,
+.card:focus-within .card-title::after,
+.home-source:hover > span::after,
+.nb-entry:hover .nb-title::after {
+  transform: scaleX(1); transform-origin: left;
+}
+
+/* ---- Active nav marker slides between topics (spring) ---------------------- */
+.tree-item { position: relative; }
+.tree-item::before {
+  content: ""; position: absolute; left: -11px; top: 50%; width: 3px; height: 0;
+  background: var(--accent); border-radius: 0 2px 2px 0;
+  transform: translateY(-50%); transition: height .32s var(--m-spring);
+}
+.tree-item.active::before { height: 62%; }
+
+/* ---- Reader enters as a settling sheet (slide-up + fade) ------------------- */
+@keyframes reader-settle { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+.reader { animation: reader-settle .34s var(--m-spring) both; }
+
+/* leaving card collapses rather than vanishing */
+.card.leaving { opacity: 0; transform: translateY(-6px); }
+
+/* ---- Restrained spring micro-interactions ---------------------------------- */
+.btn.primary, .chip, .home-source { transition:
+  background-color .16s var(--m-ease), border-color .18s var(--m-ease),
+  color .18s var(--m-ease), transform .22s var(--m-spring); }
+.btn.primary:hover { transform: translateY(-1px); }
+.btn.primary:active:not(:disabled) { transform: translateY(0); }
+.chip:hover { transform: translateY(-1px); }
+.home-source:hover { transform: translateX(3px); }
+.card-img { transition: transform .4s var(--m-ease), filter .4s var(--m-ease); }
+.card:hover .card-img { transform: scale(1.015); }
+
+/* ---- Skiper4 theme toggle: circular reveal of the new theme ---------------- */
+/* app.js seeds --vt-x/--vt-y from the button, then startViewTransition swaps. */
+::view-transition-old(root) { animation: none; }
+::view-transition-new(root) {
+  animation: m-theme-reveal .5s var(--m-ease) both;
+}
+@keyframes m-theme-reveal {
+  from { clip-path: circle(0% at var(--vt-x, 50%) var(--vt-y, 0%)); }
+  to   { clip-path: circle(150% at var(--vt-x, 50%) var(--vt-y, 0%)); }
+}
+.theme-btn svg, .theme-btn { transition: transform .4s var(--m-spring); }
+.theme-btn:active { transform: rotate(45deg) scale(.94); }
+
+@media (prefers-reduced-motion: reduce) {
+  /* belt-and-braces: cancel the reveal and any transforms if the global
+     reset is ever overridden by cascade order */
+  ::view-transition-old(root), ::view-transition-new(root) { animation: none !important; }
+  .card:hover .card-img, .home-source:hover, .btn.primary:hover, .chip:hover { transform: none !important; }
+}

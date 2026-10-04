@@ -20,6 +20,8 @@
   <link rel="stylesheet" href="/static/article.css">
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/reading-refresh.css">
+  <link rel="stylesheet" href="/static/briefing.css">
+  <link rel="stylesheet" href="/static/motion.css">
   <script>
     // applied before paint so a saved theme doesn't flash; app.js owns the toggle
     try { const t = JSON.parse(localStorage.getItem('theme')); if (t) document.documentElement.dataset.theme = t; } catch {}
@@ -99,6 +101,7 @@
 <script defer src="/static/vendor/hljs/highlight.min.js"></script>
 <script defer src="/static/article.js"></script>
 <script defer src="/static/app.js"></script>
+<script defer src="/static/briefing.js"></script>
 <script type="module" src="/static/babel.js"></script>
 </body>
 </html>

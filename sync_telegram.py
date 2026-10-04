@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path, PurePosixPath
 
+from telegram_setup import TREES, TelegramSetupError, require_restored_data, tgfs_python
+
 
 def tgfs_project() -> Path:
     configured = os.environ.get("TGFS_PROJECT")
@@ -17,16 +19,24 @@ def tgfs_project() -> Path:
 
 
 TGFS_PROJECT = tgfs_project()
-sys.path.insert(0, str(TGFS_PROJECT / "src"))
-
-from tgfs.config import Config  # noqa: E402
-from tgfs.session import open_storage  # noqa: E402
-from tgfs.system import keyring_get  # noqa: E402
-
-
 DATA_ROOT = Path(os.environ.get("MEDIUM_LIBRARY_DATA", r"E:\storage\newsletter-active"))
 REMOTE_ROOT = os.environ.get("TGFS_NEWSLETTER_PATH", "/newsletter-archive-2026-10-02")
-TREES = ("Medium-Library", "notes", "CVEs", "search-index")
+
+
+def tgfs_modules():
+    # Validate local data first; an incomplete cache must not trigger remote setup or IO.
+    tgfs_python(TGFS_PROJECT)
+    sys.path.insert(0, str(TGFS_PROJECT / "src"))
+    try:
+        from tgfs.config import Config
+        from tgfs.session import open_storage
+        from tgfs.system import keyring_get
+    except ModuleNotFoundError as exc:
+        raise TelegramSetupError(
+            f"TGFS dependency {exc.name!r} is unavailable. Install TGFS requirements in its own "
+            "virtual environment and run sync with that Python."
+        ) from exc
+    return Config, open_storage, keyring_get
 
 
 def sha256(path: Path) -> str:
@@ -38,8 +48,11 @@ def sha256(path: Path) -> str:
 
 
 async def sync() -> None:
-    if not DATA_ROOT.is_dir():
-        raise SystemExit(f"Newsletter data folder is missing: {DATA_ROOT}")
+    try:
+        require_restored_data(DATA_ROOT)
+    except TelegramSetupError as exc:
+        raise SystemExit(f"Refusing Telegram sync: {exc}") from exc
+    Config, open_storage, keyring_get = tgfs_modules()
     cfg = Config.load()
     secret = keyring_get() if cfg.encrypt else None
     changed = 0
@@ -47,8 +60,6 @@ async def sync() -> None:
     async with open_storage(cfg, lambda _first_time: secret or "", with_cipher=cfg.encrypt) as storage:
         for tree in TREES:
             local_tree = DATA_ROOT / tree
-            if not local_tree.is_dir():
-                raise SystemExit(f"Expected data folder is missing: {local_tree}")
             for local in sorted(local_tree.rglob("*")):
                 if not local.is_file() or local.is_symlink() or local.name.endswith((".tgfs-part", "-shm", "-wal")):
                     continue

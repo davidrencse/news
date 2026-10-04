@@ -21,9 +21,10 @@ from urllib.parse import unquote, urlsplit
 
 import polite
 import relevance
+from performance import INDEX_REQUEST_GAP
 
 SITEMAP_INDEX = "https://medium.com/sitemap/sitemap.xml"
-REQUEST_GAP = 1.5          # seconds between sitemap downloads
+REQUEST_GAP = INDEX_REQUEST_GAP  # extra idle time; polite.py also spaces requests
 INDEX_REFRESH = 6 * 3600   # re-read the list of sitemaps this often
 RECHECK_DAYS = 3           # the newest days are re-crawled when Medium updates them
 MIN_FREE_GB = 2            # stop growing the index when its drive gets this full

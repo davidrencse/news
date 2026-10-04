@@ -28,6 +28,7 @@ from pydantic import BaseModel
 import polite
 import cve_sources
 from cve_catalog import CVECatalog
+from briefing import BriefingService
 from curator import Curator
 from medium_index import MediumIndex
 from pipeline import PdfPipeline, PipelineError
@@ -283,6 +284,7 @@ class CVEStore:
 
 cve_store = CVEStore(CVE_DB_PATH)
 cve_catalog = CVECatalog(CVE_CATALOG_PATH)
+briefing_service = BriefingService()
 pipeline = PdfPipeline(STATIC_DIR)
 jobs: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()  # the event loop only keeps weak references to running tasks
@@ -510,11 +512,31 @@ async def lifespan(_app):
     yield
     curator.stop()
     medium_index.stop()
+    briefing_service.stop()
     pipeline.close()
     store.stop()
 
 
 app = FastAPI(title="Library of Babel", lifespan=lifespan)
+
+
+class BriefingIn(BaseModel):
+    days: int = 3
+
+
+@app.get("/api/briefing")
+def briefing_status():
+    return briefing_service.snapshot()
+
+
+@app.post("/api/briefing", status_code=202)
+def create_briefing(body: BriefingIn):
+    try:
+        return briefing_service.start(body.days)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 class TopicIn(BaseModel):
@@ -596,10 +618,14 @@ def _library_page_index():
 
         for article in articles:
             tid, sid = article.get("topic", ""), article.get("subtopic", "")
-            topic_counts = counts["topics"].setdefault(tid, bucket())
-            sub_counts = topic_counts["subtopics"].setdefault(sid, bucket())
-            scopes.setdefault((tid, ""), {"all": [], "free": [], "locked": []})
-            scopes.setdefault((tid, sid), {"all": [], "free": [], "locked": []})
+            if tid not in counts["topics"]:
+                counts["topics"][tid] = bucket()
+                scopes[(tid, "")] = {"all": [], "free": [], "locked": []}
+            topic_counts = counts["topics"][tid]
+            if sid not in topic_counts["subtopics"]:
+                topic_counts["subtopics"][sid] = bucket()
+                scopes[(tid, sid)] = {"all": [], "free": [], "locked": []}
+            sub_counts = topic_counts["subtopics"][sid]
             for target in (counts, topic_counts, sub_counts):
                 target["total"] += 1
                 if article.get("locked") is False:
@@ -629,21 +655,20 @@ def get_library_first_page(limit: int = 60, topic_id: str = "", subtopic_id: str
         raise HTTPException(400, "A topic is required with a subtopic.")
     with store.lock:
         topics = json.loads(json.dumps(store.data["topics"]))
-        articles = tuple(store.data["articles"])
         version = store.version
-    selected = []
-    for article in articles:
-        if topic_id and article.get("topic") != topic_id:
-            continue
-        if subtopic_id and article.get("subtopic") != subtopic_id:
-            continue
-        if access == "free" and article.get("locked") is not False:
-            continue
-        if access == "locked" and article.get("locked") is not True:
-            continue
-        selected.append(article)
-        if len(selected) >= limit:
-            break
+        selected = []
+        for article in store.data["articles"]:
+            if topic_id and article.get("topic") != topic_id:
+                continue
+            if subtopic_id and article.get("subtopic") != subtopic_id:
+                continue
+            if access == "free" and article.get("locked") is not False:
+                continue
+            if access == "locked" and article.get("locked") is not True:
+                continue
+            selected.append(dict(article))
+            if len(selected) >= limit:
+                break
     rows = []
     for article in selected:
         row = public(article)

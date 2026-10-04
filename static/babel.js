@@ -1254,8 +1254,8 @@ function syncButton() {
 document.getElementById('babelBtn')?.addEventListener('click', () => setEnabled(!enabled()));
 syncButton();
 
-// fetch Three.js while the browser is idle so the first click doesn't wait for it
-// build the library while the browser is idle so the first click starts at once
-if (enabled()) whenIdle(() => prepare().catch(() => {}), 4000);
+// Preload the module while idle; build textures and compile shaders only when an intro is played.
+// Preparing the whole 3D scene here blocks the main thread while the first cards are appearing.
+if (enabled()) whenIdle(() => loadThree().catch(() => {}), 4000);
 
 window.BabelIntro = { play, enabled, setEnabled, get playing() { return !!active; } };

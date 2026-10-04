@@ -22,6 +22,7 @@ from playwright.async_api import async_playwright
 
 import medium_render
 import polite
+from performance import ARTICLE_WORKERS, IMAGE_WORKERS
 
 FREEDIUM_BASE = os.environ.get("FREEDIUM_BASE", "https://freedium-mirror.cfd").rstrip("/")
 # Mirrors tried in order when the one above doesn't return the article. Freedium mirrors come and go,
@@ -30,7 +31,7 @@ FREEDIUM_BASE = os.environ.get("FREEDIUM_BASE", "https://freedium-mirror.cfd").r
 _EXTRA = [m.strip().rstrip("/") for m in os.environ.get("FREEDIUM_MIRRORS", "").split(",") if m.strip()]
 FREEDIUM_MIRRORS = list(dict.fromkeys([FREEDIUM_BASE] + (_EXTRA or ["https://freedium.cfd"])))
 CHROMIUM_PATH = os.environ.get("CHROMIUM_PATH")  # use a Chromium already on this machine
-MAX_PARALLEL = 2
+MAX_PARALLEL = ARTICLE_WORKERS
 PAGE_WIDTH_PX = 794  # A4 width; the PDF is one page this wide and as tall as the article
 
 # Runs inside the Freedium page: metadata plus the story rebuilt from a small set of safe tags.
@@ -114,7 +115,7 @@ def localize_images(content, out_dir):
             return url, None  # a missing image is not worth failing the article for; keep the online URL
         return url, f"images/{i:03d}{ext}"
 
-    with ThreadPoolExecutor(6) as pool:
+    with ThreadPoolExecutor(IMAGE_WORKERS) as pool:
         local = {url: name for url, name in pool.map(fetch, enumerate(urls, 1)) if name}
     return IMG_SRC.sub(lambda m: f'<img src="{local.get(html.unescape(m.group(1)), m.group(1))}"', content)
 

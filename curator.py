@@ -32,14 +32,16 @@ from datetime import date, datetime, timedelta, timezone
 
 import medium_render
 import polite
+from performance import (CURATOR_PAGES_PER_CYCLE, CURATOR_ADDS_PER_CYCLE,
+                         CURATOR_CYCLE_SECONDS, CURATOR_FAST_CYCLE_SECONDS)
 
 MEMBER_ONLY = True     # the library collects paywalled stories only; free ones are not added and get dropped
 CAP = 12               # minimum auto-added articles kept per subtopic
 TOPIC_TARGET = 1120    # each topic aims for at least this many; its subtopics share the target
-PAGES_PER_CYCLE = 5    # post pages read per cycle
-ADDS_PER_CYCLE = 3     # keeps churn gentle once a subtopic is full
-CYCLE_SECONDS = 120
-FAST_CYCLE_SECONDS = 3
+PAGES_PER_CYCLE = CURATOR_PAGES_PER_CYCLE
+ADDS_PER_CYCLE = CURATOR_ADDS_PER_CYCLE
+CYCLE_SECONDS = CURATOR_CYCLE_SECONDS
+FAST_CYCLE_SECONDS = CURATOR_FAST_CYCLE_SECONDS
 POOL_SIZE = 100        # candidate URLs considered per cycle
 SCAN_LIMIT = 4000      # index rows looked at per priority tier; a full subtopic has excluded most of them
 RECENT_DAYS = 14

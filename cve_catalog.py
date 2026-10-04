@@ -10,6 +10,7 @@ import time
 import urllib.request
 import zipfile
 from contextlib import contextmanager
+from performance import CVE_IMPORT_BATCH_SIZE
 
 API = "https://api.github.com/repos/CVEProject/cvelistV5/releases?per_page=100"
 UA = "LibraryOfBabel/1.0 (personal research library)"
@@ -239,7 +240,7 @@ class CVECatalog:
                                   json.dumps(record, ensure_ascii=False, separators=(",", ":"))))
                 except (ValueError, OSError, KeyError, TypeError):
                     continue
-                if len(batch) >= 5000:
+                if len(batch) >= CVE_IMPORT_BATCH_SIZE:
                     self._write_batch(db, batch); count += len(batch); batch.clear()
                     db.commit()
                     self._set(records=count)
