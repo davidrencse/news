@@ -26,13 +26,13 @@ async function openBriefing() {
   }
 }
 
-async function generateBriefing() {
+async function generateBriefing(force = false) {
   if (briefingView.requesting) return;
   briefingView.requesting = true;
   briefingView.error = '';
   renderBriefingHead();
   try {
-    briefingView.job = await api('/api/briefing', { method: 'POST', body: { days: briefingView.days } });
+    briefingView.job = await api('/api/briefing', { method: 'POST', body: { days: briefingView.days, force } });
     briefingView.days = briefingView.job.days;
     scheduleBriefingPoll();
   } catch (err) {
@@ -40,6 +40,27 @@ async function generateBriefing() {
   } finally {
     briefingView.requesting = false;
     if (S.mode === 'briefing') { renderBriefingHead(); renderBriefingList(); }
+  }
+}
+
+async function saveBriefingPick(index, btn) {
+  const item = briefingView.job?.articles?.[index];
+  if (!item || btn.disabled) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const res = await api('/api/briefing/save', { method: 'POST', body: {
+      url: item.resolved_url || item.url, title: item.title,
+      source: item.source, published: item.published, snippet: item.reason } });
+    btn.textContent = res.fetched ? 'Saved to library ✓' : 'Saved as link ✓';
+    btn.classList.add('saved');
+    toast(res.fetched ? 'Saved to your library under Morning Briefing.'
+                      : 'Saved as a link; the full text could not be fetched.');
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = original;
+    toast(err.message);
   }
 }
 
@@ -73,17 +94,22 @@ function renderBriefingHead() {
       <button class="btn primary" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'Scanning news…' : 'Generate briefing'}</button>
     </form></div>`;
   $('#briefingDays').onchange = e => { briefingView.days = Number(e.target.value); };
-  $('#briefingForm').onsubmit = e => { e.preventDefault(); generateBriefing(); };
+  $('#briefingForm').onsubmit = e => { e.preventDefault(); generateBriefing(true); };
 }
 
 function briefingStory(item, rank, compact = false) {
+  const link = item.resolved_url || item.url;
+  const related = item.related ? `<span class="briefing-related">+${item.related} related ${item.related === 1 ? 'story' : 'stories'}</span>` : '';
   return `<article class="briefing-story ${compact ? 'briefing-story-compact' : ''}">
     <span class="briefing-rank" aria-label="Pick ${rank}">${String(rank).padStart(2, '0')}</span>
     <div><p class="briefing-byline">${esc(item.category)} <span aria-hidden="true">·</span> ${esc(item.source)}
-      <span aria-hidden="true">·</span> <time datetime="${esc(item.published)}">${esc(briefingDate(item.published))}</time></p>
-      <h2><a href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">${esc(item.title)}</a></h2>
+      <span aria-hidden="true">·</span> <time datetime="${esc(item.published)}">${esc(briefingDate(item.published))}</time>${related}</p>
+      <h2><a href="${esc(link)}" target="_blank" rel="noopener noreferrer">${esc(item.title)}</a></h2>
       ${compact ? '' : `<p class="briefing-reason">${esc(item.reason)}</p>`}
-      <a class="briefing-read" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">Read story<span class="sr-only"> (opens in a new tab)</span></a>
+      <div class="briefing-actions">
+        <a class="briefing-read" href="${esc(link)}" target="_blank" rel="noopener noreferrer">Read story<span class="sr-only"> (opens in a new tab)</span></a>
+        ${compact ? '' : `<button class="btn small ghost" data-save="${rank - 1}">Save to library</button>`}
+      </div>
     </div></article>`;
 }
 
@@ -123,6 +149,9 @@ function renderBriefingList() {
       <ul class="briefing-topics">${topics}</ul>
       ${job.errors?.length ? `<p>Unavailable topics: ${job.errors.map(e => esc(e.topic)).join(', ')}.</p>` : ''}
     </details>
-    <p class="briefing-footnote">Links open through Google News to the publisher. Publisher access restrictions may apply. The time window is fixed when you generate; generate again for a fresh edition.</p>
+    <p class="briefing-footnote">Links open to the publisher (resolved from Google News where possible). Publisher access restrictions may apply. The time window is fixed when you generate; generate again for a fresh edition.</p>
   </section>`;
+  $('#list').querySelectorAll('[data-save]').forEach(btn => {
+    btn.onclick = () => saveBriefingPick(Number(btn.dataset.save), btn);
+  });
 }

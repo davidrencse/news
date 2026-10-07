@@ -62,6 +62,7 @@ MAX_PER_AUTHOR = 2
 EXPLORE_EVERY = 7   # one in this many slots goes to something adjacent to your taste
 ROTATION = 0.04     # hourly reshuffle, small enough that a strong match stays on top
 MEMO_SECONDS = 60   # reuse a ranking this long unless the library or page cache changes
+MEMO_MAX = 64       # cap distinct cached rankings: the key includes caller-controlled labels/limit
 
 
 def _norm(label):
@@ -73,7 +74,7 @@ def _has_notes(notes_path):
         with open(notes_path, encoding="utf-8") as f:
             n = json.load(f)
         return bool(n.get("highlights") or (n.get("notes") or "").strip())
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):  # AttributeError: a notes file that is valid JSON but not an object
         return False
 
 
@@ -109,6 +110,7 @@ class Recommender:
         self.index = index
         self._memo = {}           # finished rankings, thrown away when the library changes
         self._cache = {}          # work that outlives a library change: taste words, index pool
+        self._legacy_notes = {}   # aid -> has-notes, for rows predating notes_count; stable per process
         self._labels = (None, [])
         self._homes = (None, {})  # (topic-tree signature, url -> subtopic it belongs in)
 
@@ -144,8 +146,16 @@ class Recommender:
 
         taste = Taste()
         for a in arts:
-            # put_notes keeps notes_count on the row; only rows from before that field need the file
-            has = a["notes_count"] > 0 if "notes_count" in a else _has_notes(self.notes_path(a["id"]))
+            # put_notes keeps notes_count on the row; only rows from before that field need the file.
+            # Notes are only ever written through put_notes (which then sets notes_count), so a legacy
+            # row's file state never changes under us — read it once and remember it, not every rebuild.
+            if "notes_count" in a:
+                has = a["notes_count"] > 0
+            else:
+                aid = a["id"]
+                if aid not in self._legacy_notes:
+                    self._legacy_notes[aid] = _has_notes(self.notes_path(aid))
+                has = self._legacy_notes[aid]
             weight, when = self._engagement(a, has)
             if not weight:
                 continue
@@ -253,9 +263,13 @@ class Recommender:
                 continue
             if include_locked is not None and m.get("locked") is not include_locked:
                 continue
-            if url not in homes:
-                homes[url] = next(((tid, s) for tid, s, ph in subs if fits(m, tid, s, ph)), None)
-            home = homes[url]
+            # Cache a post's subtopic keyed on the fields fits() reads, so when the curator later fills
+            # in a post's tags its home is recomputed instead of staying stuck (often as None/"unsorted").
+            fp = (m.get("title"), tuple(m.get("tags") or []))
+            cached = homes.get(url)
+            if not cached or cached[0] != fp:
+                cached = homes[url] = (fp, next(((tid, s) for tid, s, ph in subs if fits(m, tid, s, ph)), None))
+            home = cached[1]
             pool[url] = (m, self.labels_of(url, *(home and (home[0], home[1]["id"]) or (None, None))), home, True)
 
         # Index rows say nothing about member-only status, so they only take part when the reader
@@ -280,6 +294,9 @@ class Recommender:
         # Rankings for an older library (or an earlier hour) can never be served again.
         self._memo = {k: v for k, v in self._memo.items() if k[3:] == key[3:]}
         self._memo[key] = (time.time(), res)
+        if len(self._memo) > MEMO_MAX:  # drop the least-recently computed so a label-cycling client can't grow it
+            for stale in sorted(self._memo, key=lambda k: self._memo[k][0])[:-MEMO_MAX]:
+                del self._memo[stale]
         return res
 
     def _rank(self, want, limit, include_locked):
@@ -411,7 +428,10 @@ class Recommender:
 
     def all_labels(self, limit=200):
         """The most common labels among candidate posts, for the label picker."""
-        if self._labels[0] != len(self.cache):
+        # Key on rev as well as len: the curator fills in tags in place, which changes the label set
+        # without changing the post count, so a len-only key would serve a stale label picker.
+        key = (len(self.cache), getattr(self.cache, "rev", 0))
+        if self._labels[0] != key:
             c = Counter(_norm(t) for _, m in self.cache.items() if m for t in m.get("tags") or [])
-            self._labels = (len(self.cache), [l for l, _ in c.most_common(limit)])
+            self._labels = (key, [l for l, _ in c.most_common(limit)])
         return self._labels[1]

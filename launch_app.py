@@ -35,7 +35,7 @@ def port_is_in_use(host: str, port: int) -> bool:
     return False
 
 
-def wait_until_ready(process, url: str, timeout: float = 300, interval: float = 0.25) -> bool:
+def wait_until_ready(process, url: str, timeout: float = 1800, interval: float = 0.25) -> bool:
     deadline = time.monotonic() + timeout
     request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
     while time.monotonic() < deadline:
@@ -69,7 +69,7 @@ def main() -> int:
     print(f"Waiting for the local app to finish loading at {url}...", flush=True)
     if not wait_until_ready(process, url):
         if process.poll() is None:
-            print("The app did not become ready within 5 minutes; stopping this app process.", flush=True)
+            print("The app did not become ready within 30 minutes; stopping this app process.", flush=True)
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -83,7 +83,7 @@ def main() -> int:
     try:
         return process.wait()
     except KeyboardInterrupt:
-        print("Stopping the app gracefully before backing up its data...", flush=True)
+        print("Stopping the app and finishing pending storage writes...", flush=True)
         try:
             return process.wait(timeout=30)
         except subprocess.TimeoutExpired:

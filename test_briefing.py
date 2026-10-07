@@ -1,4 +1,5 @@
 """Deterministic briefing checks; all news feeds are local fixtures."""
+import base64
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 import threading
@@ -140,6 +141,144 @@ class BriefingTests(unittest.TestCase):
                 return job
             time.sleep(0.01)
         self.fail("Fixture scan did not complete")
+
+
+class RankingTests(unittest.TestCase):
+    def row(self, i, title, score, group="AI", source=None):
+        return {"title": title, "url": f"https://ex.com/{i}", "source": source or f"Pub {i}",
+                "published": NOW.isoformat(), "category": group, "topics": [f"t{i}"], "score": score}
+
+    def test_interest_boost_lifts_followed_subjects(self):
+        from briefing import interest_tokens, select_briefing
+        interests = interest_tokens([{"name": "AI", "subtopics": [
+            {"name": "LLMs", "tags": ["large-language-models"]}]}])
+        self.assertIn("language", interests)
+        # The boost is capped so it never swamps freshness; a close race is what it is meant to tip.
+        rows = [self.row(0, "Weather stays mild this weekend", 4.8, "World"),
+                self.row(1, "New large language models cut costs", 3.5, "AI")]
+        result = select_briefing(rows, interests)
+        top = result["articles"][0]
+        self.assertEqual(top["url"], "https://ex.com/1")        # boosted past the fresher weather item
+        self.assertGreater(top["score"], top["base_score"])     # the boost is recorded, not hidden
+        self.assertEqual(rows[0]["score"], 4.8)                 # inputs are not mutated
+
+    def test_clustering_groups_retellings_and_caps_dominance(self):
+        from briefing import select_briefing
+        rows = [self.row(0, "Apple unveils new M5 chip for laptops", 5.0, "Devices"),
+                self.row(1, "Apple reveals the new M5 chip in laptops", 4.9, "Devices"),
+                self.row(2, "Floods displace thousands across the region", 4.0, "World")]
+        result = select_briefing(rows)
+        clusters = {x["cluster"] for x in result["shortlist"]}
+        self.assertEqual(len(result["articles"]), 2)            # the two M5 retellings collapse to one slot
+        self.assertEqual(len(clusters), 2)
+        m5 = next(x for x in result["shortlist"] if "M5" in x["title"])
+        self.assertEqual(m5["related"], 1)
+
+
+class ResolveTests(unittest.TestCase):
+    def google(self, payload):
+        seg = base64.urlsafe_b64encode(b"\x08\x13\x22" + payload).decode().rstrip("=")
+        return f"https://news.google.com/rss/articles/{seg}?oc=5"
+
+    def test_passthrough_leaves_publisher_urls(self):
+        from briefing import resolve_article_url
+        url = "https://www.bbc.com/news/world-123"
+        self.assertEqual(resolve_article_url(url, fetch=self.fail), url)  # no fetch for a real link
+
+    def test_decodes_embedded_publisher_url(self):
+        from briefing import resolve_article_url
+        url = self.google(b"https://www.reuters.com/tech/story-9")
+        self.assertEqual(resolve_article_url(url, fetch=self.fail), "https://www.reuters.com/tech/story-9")
+
+    def test_falls_back_to_scraping_landing_page(self):
+        from briefing import resolve_article_url
+        page = b'<a href="https://news.google.com/x">self</a><a href="https://apnews.com/article/abc">real</a>'
+        url = "https://news.google.com/rss/articles/NOTBASE64?oc=5"
+        self.assertEqual(resolve_article_url(url, fetch=lambda u, **k: page), "https://apnews.com/article/abc")
+
+    def test_fetch_failure_returns_original(self):
+        from briefing import resolve_article_url
+        def boom(*a, **k):
+            raise OSError("down")
+        url = "https://news.google.com/rss/articles/NOTBASE64?oc=5"
+        self.assertEqual(resolve_article_url(url, fetch=boom), url)
+
+
+class ExtractTests(unittest.TestCase):
+    def page(self, body):
+        return ('<html><head><meta property="og:title" content="A Clear Title">'
+                '<meta property="og:image" content="/img/hero.jpg"></head>'
+                f'<body>{body}</body></html>').encode()
+
+    def test_extracts_article_and_drops_chrome(self):
+        from briefing import fetch_article
+        body = ('<nav>site menu junk</nav><article><h2>Section</h2>'
+                '<p>' + "The committee released its findings on Thursday afternoon. " * 12 + '</p>'
+                '<ul><li>first point</li><li>second point</li></ul>'
+                '<img src="/media/pic.png"></article><footer>footer junk</footer>')
+        meta = fetch_article("https://news.site/story", fetch=lambda u, **k: self.page(body))
+        self.assertEqual(meta["title"], "A Clear Title")
+        self.assertEqual(meta["image"], "https://news.site/img/hero.jpg")
+        self.assertIn("committee released", meta["body"])
+        self.assertNotIn("menu junk", meta["body"])
+        self.assertNotIn("footer junk", meta["body"])
+        self.assertIn("<ul>", meta["body"])
+        self.assertIn("<li>first point</li>", meta["body"])
+        self.assertIn("</ul>", meta["body"])
+        self.assertLess(meta["body"].index("<ul>"), meta["body"].index("<li>first point</li>"))
+        self.assertIn('src="https://news.site/media/pic.png"', meta["body"])
+
+    def test_thin_page_raises(self):
+        from briefing import fetch_article
+        with self.assertRaises(ValueError):
+            fetch_article("https://news.site/x", fetch=lambda u, **k: self.page("<p>too short</p>"))
+
+    def test_escapes_html_in_text(self):
+        from briefing import fetch_article
+        body = "<article><p>" + "Risk &amp; reward in &lt;markets&gt; this quarter. " * 12 + "</p></article>"
+        meta = fetch_article("https://news.site/x", fetch=lambda u, **k: self.page(body))
+        self.assertIn("&amp;", meta["body"])
+        self.assertNotIn("<markets>", meta["body"])  # angle brackets from the source are neutralised
+
+
+class ResolverWiringTests(unittest.TestCase):
+    def wait(self, service):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = service.snapshot()
+            if job["state"] != "running":
+                return job
+            time.sleep(0.01)
+        self.fail("scan did not complete")
+
+    def test_shortlist_urls_are_resolved(self):
+        service = BriefingService(fixture_fetch, resolver=lambda u: u + "#r")
+        service.start(3, NOW)
+        job = self.wait(service)
+        self.assertTrue(job["shortlist"])
+        self.assertTrue(all(x["resolved_url"] == x["url"] + "#r" for x in job["shortlist"]))
+
+    def test_without_resolver_url_is_unchanged(self):
+        service = BriefingService(fixture_fetch)
+        service.start(3, NOW)
+        job = self.wait(service)
+        self.assertTrue(all(x["resolved_url"] == x["url"] for x in job["shortlist"]))
+
+    def test_fresh_edition_is_reused_without_now(self):
+        calls = []
+        def fetch(*a):
+            calls.append(a[1])
+            return fixture_fetch(*a)
+        service = BriefingService(fetch)
+        service.start(3)                 # real click: no `now`
+        self.wait(service)
+        runs = len(set(calls))
+        service.start(3)                 # immediate repeat within the anti-thrash window
+        self.wait(service)
+        self.assertEqual(len(set(calls)), runs)   # reused, the news source was not hit again
+        forced = service.start(3, force=True)
+        self.wait(service)
+        self.assertEqual(forced["state"] in ("running", "complete"), True)
 
 
 if __name__ == "__main__":

@@ -42,15 +42,8 @@ const S = {
   sort: local.get('discoverSort', 'foryou'),  // Discover: 'foryou' (recommended) | 'trending'
   labels: local.get('labels', []),            // Discover "For you": only posts with one of these labels
   rec: null,             // {items, labels, top_labels, engaged} from /api/recommend
-  cves: [],
-  cvesLoaded: false,
-  cveCatalog: { count: 0, job: { state: 'idle' } },
-  cveCatalogItems: [],
-  cveCatalogQuery: '',
-  cveCatalogYear: '',
-  cveCatalogOffset: 0,
-  cveCatalogTotal: 0,
-  cveCatalogPoll: null,
+  papers: [],
+  papersLoaded: false,
 };
 
 // "New" means added by the curator since the previous visit (nothing is new on a first visit).
@@ -91,7 +84,7 @@ function toast(msg, ms = 2600, action = null) {
 }
 
 async function load() {
-  // Load the saved CVE shelf when Vulnerabilities opens; it can be large and is fetched there too.
+  // The research-paper shelf is loaded lazily when its view opens, not on first library load.
   const selectionBefore = JSON.stringify(S.sel);
   let data = await api(`/api/library/first?${new URLSearchParams({ limit: PAGE, topic_id: S.sel.topic || '', subtopic_id: S.sel.sub || '', access: S.access })}`);
   S.topics = data.topics;
@@ -172,7 +165,9 @@ function select(t, s) {
   S.mode = 'browse'; S.search = null; S.limit = PAGE; $('#search').value = '';
   local.set('sel', S.sel);
   closeReader();
-  if (S.tab === 'library') loadLibraryPage();
+  // Update the sidebar and header synchronously so navigation (e.g. leaving the briefing for the
+  // library) is reflected at once, instead of only after the page request returns.
+  if (S.tab === 'library') { renderTree(); renderHead(); loadLibraryPage(); }
   else { render(); if (s) loadDiscover(); }
 }
 
@@ -187,8 +182,8 @@ function renderTree() {
     <span class="label">✦ Discover</span><span class="count">${S.suggest?.items ? S.suggest.items.length : ''}</span></button>
     <button class="tree-item tree-all tree-notebook ${S.mode === 'notebook' ? 'active' : ''}" data-notebook>
     <span class="label">✎ Notebook</span><span class="count">${fmtCount(S.libraryCounts.noted) || ''}</span></button>
-    <button class="tree-item tree-all tree-cves ${S.mode === 'cves' ? 'active' : ''}" data-cves>
-    <span class="label">Vulnerabilities</span><span class="count">${S.cveCatalog.count ? fmtCount(S.cveCatalog.count) : S.cves.length || ''}</span></button>`;
+    <button class="tree-item tree-all tree-papers ${S.mode === 'papers' ? 'active' : ''}" data-papers>
+    <span class="label">Research papers</span><span class="count">${S.papers.length || ''}</span></button>`;
   h += `<button class="tree-item tree-all ${S.mode === 'briefing' ? 'active' : ''}" data-briefing>
     <span class="label">Morning briefing</span></button>`;
   for (const t of S.topics) {
@@ -212,7 +207,7 @@ $('#tree').addEventListener('click', e => {
   if (add) return newTopic(add.dataset.add);
   if (e.target.closest('[data-discover-all]')) return openDiscover();
   if (e.target.closest('[data-notebook]')) return openNotebook();
-  if (e.target.closest('[data-cves]')) return openCves();
+  if (e.target.closest('[data-papers]')) return openPapers();
   const b = e.target.closest('.tree-item');
   if (!b) return;
   const t = b.dataset.t || null, s = b.dataset.s || null;
@@ -225,188 +220,146 @@ $('#tree').addEventListener('click', e => {
 });
 $('#newTopicBtn').onclick = () => newTopic('custom');
 
-async function openCves() {
-  S.mode = 'cves'; S.search = null; S.tab = 'library';
+async function openPapers() {
+  S.mode = 'papers'; S.search = null; S.tab = 'library';
   drawer(false); closeReader();
-  renderHead();
-  $('#list').innerHTML = '<div class="loading">Loading saved vulnerability records…</div>';
+  renderHead(); renderPaperHead();
+  $('#list').innerHTML = '<div class="loading">Loading your research papers…</div>';
   try {
-    const data = await api('/api/cves');
-    S.cves = data.items || [];
-    S.cvesLoaded = true;
-    S.cveCatalog = await api('/api/cves/catalog/status').catch(() => S.cveCatalog);
-    await searchCveCatalog(false);
-    renderTree(); renderHead(); renderCves();
-    if (S.cveCatalog.job?.state === 'running') pollCveCatalog();
+    const data = await api('/api/papers');
+    S.papers = data.items || [];
+    S.papersLoaded = true;
+    renderTree(); renderPapers();
   } catch (err) {
-    $('#list').innerHTML = `<div class="empty"><b>Could not load CVEs</b>${esc(err.message)}</div>`;
+    $('#list').innerHTML = `<div class="empty"><b>Could not load papers</b>${esc(err.message)}</div>`;
   }
 }
 
-function renderCveHead() {
-  const job = S.cveCatalog.job || {};
-  const busy = job.state === 'running';
-  const progress = job.phase?.startsWith('Importing') ? `${fmtCount(job.records || 0)} records` : job.total_bytes ? `${Math.min(100, Math.round(job.bytes * 100 / job.total_bytes))}%` : '';
-  $('#viewHead').innerHTML = `<div class="cve-intro">
-      <div><h1>Vulnerability records</h1><p>Search the complete official CVE List, then keep records you care about on your shelf.</p></div>
-      <div class="cve-catalog-sync"><div><b>Official CVE List V5</b><span id="cveCatalogStatus">${S.cveCatalog.count ? `${fmtCount(S.cveCatalog.count)} records indexed` : 'Full catalog not imported'}</span></div>
-        <button id="cveCatalogSync" class="btn ${S.cveCatalog.count ? 'ghost' : 'primary'}" ${busy ? 'disabled' : ''}>${busy ? `${esc(job.phase || 'Importing')} ${progress}` : S.cveCatalog.count ? 'Sync latest updates' : 'Import complete CVE catalog'}</button></div>
-      <form id="cveImportForm" class="cve-import-form">
-        <label for="cveId">CVE identifier</label>
-        <div class="cve-import-row"><input id="cveId" class="input" name="cve_id" required pattern="CVE-[0-9]{4}-[0-9]{4,}" placeholder="CVE-2024-12345" autocomplete="off" spellcheck="false">
-          <button class="btn primary" type="submit">Add and enrich</button></div>
+function renderPaperHead() {
+  $('#viewHead').innerHTML = `<div class="paper-intro">
+      <div class="paper-intro-text"><h1>Research papers</h1>
+        <p>Add a paper by its DOI. Its title, authors, abstract, and venue come from Crossref and stay on your shelf — kept in Telegram like everything else.</p></div>
+      <form id="paperImportForm" class="paper-add">
+        <label class="paper-add-field">
+          <span>DOI</span>
+          <input id="paperDoi" class="input" name="doi" required placeholder="10.1145/3292500.3330701  ·  or a https://doi.org/… link" autocomplete="off" spellcheck="false">
+        </label>
+        <button class="btn primary" type="submit">Add paper</button>
       </form>
-    </div>
-    <div class="cve-source-line"><span>Enrichment sources</span><b>NVD</b><b>CVE.org / MITRE</b><b>GitHub Advisories</b><b>CISA KEV</b><b>OSV</b><b>Red Hat</b><b>Microsoft</b><b>Cisco</b></div>
-    <div class="cve-catalog-search"><form id="cveCatalogForm" role="search"><input class="input" id="cveCatalogQuery" aria-label="Search CVE IDs and descriptions" placeholder="Search CVE IDs and descriptions" value="${esc(S.cveCatalogQuery)}"><input class="input" id="cveCatalogYear" aria-label="Filter by CVE year" inputmode="numeric" pattern="[0-9]{4}" placeholder="Year" value="${esc(S.cveCatalogYear)}"><button class="btn ghost">Search catalog</button></form>
-      <div class="tabs cve-tabs"><span class="tab active">Official catalog · ${fmtCount(S.cveCatalogTotal || S.cveCatalog.count)}</span><span class="tab-note">Your shelf · ${S.cves.length} saved · ${S.cveCatalog.last_sync ? `Updated ${fmtDate(S.cveCatalog.last_sync.slice(0, 10))}` : 'Not yet synced'}</span></div></div>`;
-  $('#cveCatalogSync').onclick = async () => {
-    try {
-      await api('/api/cves/catalog/sync', { method: 'POST' });
-      toast('Started full CVE List V5 import');
-      pollCveCatalog();
-    } catch (err) { toast(`Could not start catalog import: ${err.message}`, 5000); }
-  };
-  $('#cveCatalogForm').onsubmit = async e => { e.preventDefault(); S.cveCatalogQuery = $('#cveCatalogQuery').value.trim(); S.cveCatalogYear = $('#cveCatalogYear').value.trim(); S.cveCatalogOffset = 0; await searchCveCatalog(); };
-  $('#cveImportForm').onsubmit = async e => {
+      <form id="paperSearchForm" class="paper-add paper-search">
+        <label class="paper-add-field">
+          <span>Add by topic</span>
+          <input id="paperQuery" class="input" placeholder="e.g. CVE software vulnerability detection" autocomplete="off">
+        </label>
+        <label class="paper-rows-field"><span>How many</span>
+          <input id="paperRows" class="input" type="number" min="1" max="100" value="25" aria-label="How many papers to add">
+        </label>
+        <button class="btn" type="submit">Add matches</button>
+      </form>
+      <p class="paper-source-note">Metadata source · <b>Crossref</b></p>
+    </div>`;
+  $('#paperImportForm').onsubmit = async e => {
     e.preventDefault();
-    const input = $('#cveId'), button = e.submitter || $('#cveImportForm button');
-    const cve_id = input.value.trim().toUpperCase();
-    button.disabled = true; button.textContent = 'Checking sources…';
+    const input = $('#paperDoi'), button = e.submitter || $('#paperImportForm button');
+    const doi = input.value.trim();
+    if (!doi) return;
+    button.disabled = true; button.textContent = 'Looking up…';
     try {
-      const record = await api('/api/cves/import', { method: 'POST', body: { cve_id } });
-      const index = S.cves.findIndex(x => x.id === record.id);
-      if (index < 0) S.cves.unshift(record); else S.cves[index] = record;
+      const record = await api('/api/papers/import', { method: 'POST', body: { doi } });
+      const index = S.papers.findIndex(x => x.id === record.id);
+      if (index < 0) S.papers.unshift(record); else S.papers[index] = record;
       input.value = '';
-      renderTree(); renderCveHead(); renderCves();
-      toast(`Added ${record.id}`);
-    } catch (err) { toast(`Could not add CVE: ${err.message}`, 5000); }
-    finally { button.disabled = false; button.textContent = 'Add and enrich'; }
+      renderTree(); renderPapers();
+      toast(`Added ${record.title}`);
+    } catch (err) { toast(`Could not add paper: ${err.message}`, 5000); }
+    finally { button.disabled = false; button.textContent = 'Add paper'; }
   };
-  $('#cveId').oninput = e => { e.target.value = e.target.value.toUpperCase(); };
-}
-
-async function searchCveCatalog(render = true) {
-  const params = new URLSearchParams({ q: S.cveCatalogQuery || '', limit: '40', offset: String(S.cveCatalogOffset || 0) });
-  if (S.cveCatalogYear) params.set('year', S.cveCatalogYear);
-  try {
-    const data = await api(`/api/cves/catalog/search?${params}`);
-    S.cveCatalogItems = data.items || []; S.cveCatalogTotal = data.total || 0;
-    if (render && S.mode === 'cves') { renderCveHead(); renderCves(); }
-  } catch (err) {
-    S.cveCatalogItems = []; S.cveCatalogTotal = 0;
-    if (render) { $('#list').innerHTML = `<div class="empty"><b>Catalog search failed</b>${esc(err.message)}</div>`; }
-  }
-}
-
-function pollCveCatalog() {
-  clearTimeout(S.cveCatalogPoll);
-  const poll = async () => {
+  $('#paperSearchForm').onsubmit = async e => {
+    e.preventDefault();
+    const input = $('#paperQuery'), button = e.submitter || $('#paperSearchForm button');
+    const query = input.value.trim();
+    const rows = Math.max(1, Math.min(100, parseInt($('#paperRows').value, 10) || 25));
+    if (!query) return;
+    button.disabled = true; button.textContent = 'Searching…';
     try {
-      S.cveCatalog = await api('/api/cves/catalog/status');
-      if (S.mode === 'cves') { renderCveHead(); renderCves(); }
-      if (S.cveCatalog.job?.state === 'running') S.cveCatalogPoll = setTimeout(poll, 1200);
-      else if (S.cveCatalog.job?.state === 'complete') { await searchCveCatalog(false); if (S.mode === 'cves') { renderTree(); renderCveHead(); renderCves(); } toast(`Catalog ready · ${fmtCount(S.cveCatalog.count)} CVE records`); }
-      else if (S.cveCatalog.job?.state === 'error') toast(`Catalog import stopped: ${S.cveCatalog.job.error}`, 7000);
-    } catch { S.cveCatalogPoll = setTimeout(poll, 4000); }
+      const data = await api('/api/papers/search_import', { method: 'POST', body: { query, rows } });
+      S.papers = data.items || S.papers;
+      input.value = '';
+      renderTree(); renderPapers();
+      toast(`Added ${data.added} paper${data.added === 1 ? '' : 's'} on “${query}”`);
+    } catch (err) { toast(`Could not add papers: ${err.message}`, 5000); }
+    finally { button.disabled = false; button.textContent = 'Add matches'; }
   };
-  S.cveCatalogPoll = setTimeout(poll, 300);
 }
 
-const scoreFor = c => c.scores?.slice().sort((a, b) => (parseFloat(b.version) || 0) - (parseFloat(a.version) || 0))[0];
-function renderCves() {
-  const saved = S.cves.length ? `<div class="cve-section-head">On your shelf <span>${fmtCount(S.cves.length)} saved records</span></div>` + S.cves.map(c => {
-    const score = scoreFor(c), kev = c.kev?.in_catalog;
-    return `<article class="cve-card"><button class="cve-card-main" data-saved-cve-open="${esc(c.id)}">
-      <span class="cve-id">${esc(c.id)}</span>${kev ? '<span class="cve-kev">Known exploited</span>' : ''}
-      ${score ? `<span class="cve-score sev-${esc((score.severity || '').toLowerCase())}">${esc(score.severity || 'CVSS')} ${esc(score.score)}</span>` : ''}
-      <span class="cve-description">${esc(c.description || 'Description not available from connected sources.')}</span>
-      <span class="cve-meta">${c.cpes?.length || 0} CPEs · ${(c.package_advisories || []).length} package advisories · ${(c.references || []).length} references</span></button>
-      <button class="cve-remove" data-cve-remove="${esc(c.id)}" aria-label="Remove ${esc(c.id)} from your shelf" title="Remove from shelf">×</button></article>`;
-  }).join('') : '';
-  let catalog = '';
-  if (!S.cveCatalogItems.length) {
-    const job = S.cveCatalog.job || {};
-    catalog = job.state === 'error'
-      ? `<div class="empty cve-empty"><b>Catalog import could not finish</b>${esc(job.error || 'Try again later.')}</div>`
-      : job.state === 'running'
-        ? `<div class="empty cve-empty"><b>Building the complete CVE catalog</b>${esc(job.phase || 'Import in progress')} · ${fmtCount(job.records || 0)} records indexed</div>`
-        : S.cveCatalog.count
-          ? '<div class="empty cve-empty"><b>No CVEs match this search</b>Try a different ID, keyword, or year.</div>'
-          : '<div class="empty cve-empty"><b>Import the full official catalog</b>CVE List V5 contains the complete CVE record archive. The download is large; the import runs in the background and builds a local searchable index.</div>';
-  } else {
-    catalog = `<div class="cve-section-head">Complete CVE List V5 <span>${fmtCount(S.cveCatalogTotal)} matches</span></div>`
-      + S.cveCatalogItems.map(c => `<article class="cve-card">
-        <button class="cve-card-main" data-cve-open="${esc(c.id)}"><span class="cve-id">${esc(c.id)}</span><span class="cve-state">${esc(c.state || '')}</span>
-          <span class="cve-description">${esc(c.description || 'Description not available in the canonical CVE record.')}</span>
-          <span class="cve-meta">${esc(c.published ? `Published ${fmtDate(c.published.slice(0, 10))}` : `CVE List V5 · ${c.year}`)}${c.updated ? ` · Updated ${fmtDate(c.updated.slice(0, 10))}` : ''}</span></button>
-        <button class="btn small ghost" data-cve-save="${esc(c.id)}">${S.cves.some(x => x.id === c.id) ? 'Refresh' : 'Add to shelf'}</button></article>`).join('')
-      + `<div class="cve-page"><span>${fmtCount(S.cveCatalogTotal)} records</span><button class="btn small ghost" data-cve-prev ${S.cveCatalogOffset <= 0 ? 'disabled' : ''}>Previous</button><button class="btn small ghost" data-cve-next ${S.cveCatalogOffset + 40 >= S.cveCatalogTotal ? 'disabled' : ''}>Next</button></div>`;
+function paperByline(p) {
+  const authors = p.authors || [];
+  if (!authors.length) return '';
+  if (authors.length <= 3) return authors.join(', ');
+  return `${authors.slice(0, 3).join(', ')} +${authors.length - 3}`;
+}
+
+function paperVenueLine(p) {
+  return [p.venue, p.year].filter(Boolean).join(' · ');
+}
+
+function renderPapers() {
+  if (!S.papers.length) {
+    $('#list').innerHTML = `<div class="empty paper-empty"><b>No papers yet</b>Paste a DOI above — for example <code>10.1145/3292500.3330701</code> — to pull in a paper's title, authors, and abstract and keep it on your shelf.</div>`;
+    return;
   }
-  $('#list').innerHTML = saved + catalog;
-  $('#list').querySelectorAll('[data-cve-open]').forEach(b => b.onclick = () => showCatalogCve(b.dataset.cveOpen));
-  $('#list').querySelectorAll('[data-saved-cve-open]').forEach(b => b.onclick = () => showCve(b.dataset.savedCveOpen));
-  $('#list').querySelectorAll('[data-cve-remove]').forEach(b => b.onclick = async () => {
-    try { await api(`/api/cves/${encodeURIComponent(b.dataset.cveRemove)}`, { method: 'DELETE' });
-      S.cves = S.cves.filter(x => x.id !== b.dataset.cveRemove); renderTree(); renderCveHead(); renderCves();
+  const cards = S.papers.map(p => `<article class="paper-card">
+      <button class="paper-card-main" data-paper-open="${esc(p.id)}">
+        <span class="paper-title">${esc(p.title || 'Untitled')}</span>
+        ${paperByline(p) ? `<span class="paper-authors">${esc(paperByline(p))}</span>` : ''}
+        ${paperVenueLine(p) ? `<span class="paper-venue">${esc(paperVenueLine(p))}</span>` : ''}
+        ${p.abstract ? `<span class="paper-abstract">${esc(p.abstract)}</span>` : ''}
+        <span class="paper-meta">
+          ${p.type ? `<span class="paper-tag">${esc(p.type)}</span>` : ''}
+          ${p.cited_by != null ? `<span>${fmtCount(p.cited_by)} citations</span>` : ''}
+          ${p.references_count ? `<span>${fmtCount(p.references_count)} references</span>` : ''}
+          <span class="paper-doi">${esc(p.doi || '')}</span>
+        </span>
+      </button>
+      <div class="paper-card-side">
+        <a class="btn small ghost" href="${esc(safeUrl(p.url || ('https://doi.org/' + (p.doi || ''))))}" target="_blank" rel="noopener noreferrer">Open ↗</a>
+        <button class="paper-remove" data-paper-remove="${esc(p.id)}" aria-label="Remove ${esc(p.title || 'paper')} from your shelf" title="Remove from shelf">×</button>
+      </div>
+    </article>`).join('');
+  $('#list').innerHTML = `<div class="paper-section-head">On your shelf <span>${fmtCount(S.papers.length)} ${S.papers.length === 1 ? 'paper' : 'papers'}</span></div>${cards}`;
+  $('#list').querySelectorAll('[data-paper-open]').forEach(b => b.onclick = () => showPaper(b.dataset.paperOpen));
+  $('#list').querySelectorAll('[data-paper-remove]').forEach(b => b.onclick = async () => {
+    const title = S.papers.find(x => x.id === b.dataset.paperRemove)?.title || 'this paper';
+    if (!confirm(`Remove “${title}” from your shelf?`)) return;
+    try {
+      await api(`/api/papers/${encodeURIComponent(b.dataset.paperRemove)}`, { method: 'DELETE' });
+      S.papers = S.papers.filter(x => x.id !== b.dataset.paperRemove);
+      renderTree(); renderPapers();
     } catch (err) { toast(err.message); }
   });
-  $('#list').querySelectorAll('[data-cve-save]').forEach(b => b.onclick = async () => {
-    b.disabled = true; b.textContent = 'Enriching…';
-    try { const record = await api('/api/cves/import', { method: 'POST', body: { cve_id: b.dataset.cveSave } });
-      const i = S.cves.findIndex(x => x.id === record.id); if (i < 0) S.cves.unshift(record); else S.cves[i] = record;
-      renderTree(); renderCveHead(); renderCves(); toast(`Added ${record.id} to your shelf`);
-    } catch (err) { b.disabled = false; b.textContent = 'Try again'; toast(`Could not enrich CVE: ${err.message}`, 5000); }
-  });
-  $('#list').querySelector('[data-cve-prev]')?.addEventListener('click', async () => { S.cveCatalogOffset = Math.max(0, S.cveCatalogOffset - 40); await searchCveCatalog(); });
-  $('#list').querySelector('[data-cve-next]')?.addEventListener('click', async () => { S.cveCatalogOffset += 40; await searchCveCatalog(); });
 }
 
-async function showCatalogCve(id) {
-  try {
-    const raw = await api(`/api/cves/catalog/${encodeURIComponent(id)}`);
-    const meta = raw.cveMetadata || {}, containers = raw.containers || {};
-    const allContainers = [containers.cna || {}, ...(containers.adp || [])];
-    const descriptions = allContainers.flatMap(x => x.descriptions || []);
-    const references = allContainers.flatMap(x => x.references || []).map(x => x.url).filter(Boolean);
-    const affected = allContainers.flatMap(x => x.affected || []);
-    const metrics = allContainers.flatMap(x => x.metrics || []);
-    const scores = metrics.flatMap(x => Object.entries(x).filter(([k, v]) => k.startsWith('cvss') && v?.baseScore != null).map(([k, v]) => ({ version: v.version || k.replace('cvss', ''), score: v.baseScore, severity: v.baseSeverity, vector: v.vectorString })));
-    const normalized = { id, description: descriptions.find(x => x.lang?.toLowerCase().startsWith('en'))?.value || descriptions[0]?.value || '', published: meta.datePublished, updated: meta.dateUpdated, scores, references, affected, sources: { cve_org_mitre: raw }, source_errors: {}, package_advisories: [], cpes: [], vendor_references: [], raw_record: raw };
-    showCve(id, normalized);
-  } catch (err) { toast(`Could not open ${id}: ${err.message}`); }
-}
-
-function showCve(id, loaded = null) {
-  const c = loaded || S.cves.find(x => x.id === id);
-  if (!c) return;
-  const score = scoreFor(c);
-  const sourceNames = ['nvd', 'cve_org_mitre', 'github_advisories', 'cisa_kev', 'osv', 'redhat', 'msrc', 'cisco'];
-  const sourceRows = sourceNames.map(name => {
-    const data = c.sources?.[name];
-    const count = Array.isArray(data) ? data.length : data ? 1 : 0;
-    const error = c.source_errors?.[name];
-    return `<div class="source-status"><b>${esc(name.replaceAll('_', ' '))}</b><span>${error ? esc(error) : `${count} record${count === 1 ? '' : 's'}`}</span></div>`;
-  }).join('');
-  const refs = (c.references || []).map(url => `<a href="${esc(safeUrl(url))}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`).join('');
-  const cpes = (c.cpes || []).map(x => `<code>${esc(x)}</code>`).join('');
-  const affected = (c.affected || []).map(x => `<pre>${esc(JSON.stringify(x, null, 2))}</pre>`).join('');
-  const packages = (c.package_advisories || []).map(x => `<div class="package-advisory"><b>${esc(x.ecosystem || 'Package')} · ${esc(x.name || x.purl || 'affected package')}</b>
-      <small>${esc(x.source || '')}</small><span>Vulnerable: ${esc(x.vulnerable || 'not specified')}</span><span>Fixed: ${esc(x.fixed || 'no fixed version listed')}</span>
-      ${x.url ? `<a href="${esc(safeUrl(x.url))}" target="_blank" rel="noopener noreferrer">Open advisory</a>` : ''}</div>`).join('');
-  const kev = c.kev?.entry;
-  dialog({ title: c.id, submit: 'Close', body: `<div class="cve-detail">
-    <p>${esc(c.description || 'No English description returned by available sources.')}</p>
-    ${score ? `<div class="cve-detail-score"><b>CVSS ${esc(score.version)} · ${esc(score.score)}</b><span>${esc(score.severity || '')}</span><code>${esc(score.vector || '')}</code></div>` : '<p class="hint">No CVSS score returned.</p>'}
-    ${kev ? `<section><h4>CISA Known Exploited Vulnerabilities</h4><p>${esc(kev.requiredAction || '')} ${kev.dueDate ? `Due ${esc(kev.dueDate)}.` : ''}</p></section>` : ''}
-    <section><h4>Vendor advisories</h4>${c.vendor_references?.length ? c.vendor_references.map(u => `<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>`).join('') : '<p class="hint">No Microsoft, Cisco, or Red Hat reference is present in the source records.</p>'}</section>
-    <section><h4>Vulnerable packages and fixes</h4>${packages || '<p class="hint">No package ranges or fixed versions returned by GitHub Advisories or OSV.</p>'}</section>
-    <section><h4>Affected products · CPE</h4>${cpes || '<p class="hint">No CPEs returned by NVD.</p>'}</section>
-    <section><h4>Canonical affected records</h4>${affected || '<p class="hint">No affected-version records returned by CVE.org / MITRE.</p>'}</section>
-    <section><h4>References</h4>${refs || '<p class="hint">No references returned.</p>'}</section>
-    <section><h4>Record metadata</h4><p>${esc(c.published ? `Published ${c.published}` : '')}${c.updated ? ` · Updated ${esc(c.updated)}` : ''}</p></section>
-    <section><h4>Source status</h4>${sourceRows}</section>
-    ${c.raw_record ? `<details><summary>Complete CVE JSON 5 record</summary><pre>${esc(JSON.stringify(c.raw_record, null, 2))}</pre></details>` : ''}
+function showPaper(id) {
+  const p = S.papers.find(x => x.id === id);
+  if (!p) return;
+  const url = safeUrl(p.url || ('https://doi.org/' + (p.doi || '')));
+  const facts = [
+    p.published ? ['Published', p.published] : null,
+    p.venue ? ['Venue', p.venue] : null,
+    p.publisher ? ['Publisher', p.publisher] : null,
+    p.type ? ['Type', p.type] : null,
+    [p.volume, p.issue, p.page].some(Boolean) ? ['Volume / issue / pages',
+      [p.volume && `vol. ${p.volume}`, p.issue && `no. ${p.issue}`, p.page && `pp. ${p.page}`].filter(Boolean).join(', ')] : null,
+    p.cited_by != null ? ['Cited by', fmtCount(p.cited_by)] : null,
+    p.references_count ? ['References', fmtCount(p.references_count)] : null,
+  ].filter(Boolean).map(([k, v]) => `<div class="paper-fact"><b>${esc(k)}</b><span>${esc(String(v))}</span></div>`).join('');
+  const subjects = (p.subjects || []).map(s => `<span class="paper-tag">${esc(s)}</span>`).join('');
+  dialog({ title: p.title || 'Untitled', submit: 'Close', body: `<div class="paper-detail">
+    ${paperByline(p) ? `<p class="paper-detail-authors">${esc((p.authors || []).join(', '))}</p>` : ''}
+    <p class="paper-detail-doi"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(p.doi || url)} ↗</a></p>
+    ${p.abstract ? `<section><h4>Abstract</h4><p>${esc(p.abstract)}</p></section>` : '<p class="hint">Crossref did not return an abstract for this paper.</p>'}
+    ${facts ? `<section><h4>Details</h4><div class="paper-facts">${facts}</div></section>` : ''}
+    ${subjects ? `<section><h4>Subjects</h4><div class="paper-tags">${subjects}</div></section>` : ''}
   </div>` });
 }
 
@@ -483,7 +436,7 @@ function renderDest() { $('#pasteDest').innerHTML = destOptions(currentDest()); 
 /* ------------------------------------------------------------ header */
 function renderHead() {
   if (S.mode === 'briefing') return renderBriefingHead();
-  if (S.mode === 'cves') return renderCveHead();
+  if (S.mode === 'papers') return renderPaperHead();
   if (S.mode === 'search') return renderSearchHead();
   if (S.mode === 'discover') return renderDiscoverHead();
   if (S.mode === 'notebook') return renderNotebookHead();
@@ -504,11 +457,11 @@ function renderHead() {
   }
   $('#viewHead').innerHTML = `
     ${home ? `<section class="home-intro">
-      <div class="home-intro-copy"><h1>A reading room for every kind of signal.</h1><p>Keep the articles that stay with you. Make room for research and vulnerability records as your library grows.</p></div>
+      <div class="home-intro-copy"><h1>A reading room for every kind of signal.</h1><p>Keep the articles that stay with you. Make room for research papers as your library grows.</p></div>
       <div class="home-source-row" aria-label="Library source types">
         <div class="home-source current"><span>Articles</span><small>Medium search · ${fmtCount(S.libraryCounts.total)} saved</small></div>
         <div class="home-source preview"><span>Research</span><small>Workspace preview</small></div>
-        <button class="home-source cve-source" type="button" data-open-cves><span>Vulnerabilities</span><small>CVEs · ${S.cvesLoaded ? `${S.cves.length} saved` : 'open shelf to load'}</small></button>
+        <button class="home-source paper-source" type="button" data-open-papers><span>Research papers</span><small>By DOI · ${S.papersLoaded ? `${S.papers.length} saved` : 'open shelf to load'}</small></button>
       </div>
     </section>` : ''}
     <div class="crumb">${crumb}</div>
@@ -525,7 +478,7 @@ function renderHead() {
     S.tab = b.dataset.tab; renderHead(); renderList();
     if (S.tab === 'discover') loadDiscover();
   });
-  $('#viewHead').querySelector('[data-open-cves]')?.addEventListener('click', openCves);
+  $('#viewHead').querySelector('[data-open-papers]')?.addEventListener('click', openPapers);
   $('#editTags') && ($('#editTags').onclick = () => editTags(S.sel.topic, s));
   $('#delSub') && ($('#delSub').onclick = () => deleteSub(S.sel.topic, s));
   $('#refreshDiscover') && ($('#refreshDiscover').onclick = () => loadDiscover(true));
@@ -538,10 +491,6 @@ function renderHead() {
 }
 
 /* ------------------------------------------------------------ lists */
-function visibleArticles() {
-  return S.articles;
-}
-
 function renderMoreButton(left) {
   if (left <= 0) return;
   $('#list').insertAdjacentHTML('beforeend', `<div class="more"><button class="btn" id="showMore">Show ${Math.min(PAGE, left)} more · ${left.toLocaleString()} left</button></div>`);
@@ -579,7 +528,7 @@ function libraryCard(a, showLoc) {
 
 function renderList() {
   if (S.mode === 'briefing') return renderBriefingList();
-  if (S.mode === 'cves') return renderCves();
+  if (S.mode === 'papers') return renderPapers();
   if (S.mode === 'search') return renderSearch();
   if (S.mode === 'discover') return renderDiscoverAll();
   if (S.mode === 'notebook') return renderNotebook();
@@ -1388,6 +1337,35 @@ const CHATGPT_URL_LIMIT = 8000;  // longer prompts are copied to the clipboard i
 const R = { article: null, notes: { notes: '', summary: '', highlights: [] }, dirty: false, saveTimer: null, selTimer: null };
 const docRoot = () => (R.article ? $('#doc') : null);
 
+// KaTeX and highlight.js (~425 KB combined) are only used to render an open article, so they load
+// on first reader open instead of weighing down every homepage visit. The promise is memoized, so
+// later opens are instant; a failed load degrades to plain (unrendered) math/code, as before.
+let readerAssets = null;
+function loadAsset(tag, attrs) {
+  return new Promise((resolve, reject) => {
+    const el = Object.assign(document.createElement(tag), attrs);
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error(`failed to load ${attrs.src || attrs.href}`));
+    document.head.appendChild(el);
+  });
+}
+function ensureReaderAssets() {
+  if (window.renderMathInElement && window.hljs) return Promise.resolve();
+  if (!readerAssets) {
+    readerAssets = (async () => {
+      // auto-render reads the global `katex`, so KaTeX itself must finish loading first.
+      const katex = loadAsset('script', { src: '/static/vendor/katex/katex.min.js' })
+        .then(() => loadAsset('script', { src: '/static/vendor/katex/auto-render.min.js' }));
+      await Promise.all([
+        katex,
+        loadAsset('link', { rel: 'stylesheet', href: '/static/vendor/katex/katex.min.css' }),
+        loadAsset('script', { src: '/static/vendor/hljs/highlight.min.js' }),
+      ]);
+    })().catch(err => { readerAssets = null; console.warn('reader assets', err); });
+  }
+  return readerAssets;
+}
+
 async function showDoc(a) {
   closePop(); hideSelTools();
   R.article = null;
@@ -1418,6 +1396,8 @@ async function showDoc(a) {
     img.referrerPolicy = 'no-referrer';
   });
   doc.querySelectorAll('a[href]').forEach(link => { link.target = '_blank'; link.rel = 'noopener noreferrer'; });
+  await ensureReaderAssets();  // the article text is already on screen; math/code render once the libraries arrive
+  if (S.reader?.id !== a.id || $('#doc') !== doc) return;
   ArticleDoc.render(doc);
   const notes = await notesPromise;
   if (S.reader?.id !== a.id || $('#doc') !== doc) return;
@@ -1949,3 +1929,14 @@ window.addEventListener('pagehide', () => {  // finish removals that were still 
 });
 
 load().catch(err => { $('#list').innerHTML = `<div class="empty"><b>Can't reach the server</b>${esc(err.message)}</div>`; });
+
+// Warm the reader's math/code libraries while the main thread is idle, so the first article opens
+// instantly instead of waiting on a ~120 KB (gzipped) download. It never blocks the homepage, and is
+// skipped on data-saver or 2G links, where a visit may never reach an article.
+{
+  const net = navigator.connection;
+  if (!net || !(net.saveData || /(^|\b)2g$/.test(net.effectiveType || ''))) {
+    (window.requestIdleCallback || (cb => setTimeout(cb, 1800)))(() => ensureReaderAssets().catch(() => {}),
+      { timeout: 6000 });
+  }
+}

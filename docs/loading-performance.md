@@ -5,6 +5,26 @@ after finding that page and copies only those rows under the store lock. Counts 
 index status load after the first rendering opportunity. Refreshing counts preserves
 existing card elements rather than rebuilding the list.
 
+The homepage no longer ships the reader's rendering libraries. KaTeX (~272 KB), its
+stylesheet (~24 KB) and highlight.js (~129 KB) — about 425 KB that the library-browsing
+view never uses — are fetched by `app.js` only when an article is first opened, then
+memoized so later opens are instant. The article text is already on screen before they
+arrive, so math and code enhance in place; a failed load degrades to plain text as before.
+The service worker still precaches these libraries off the critical path, so an installed
+phone keeps rendering saved articles offline, and the PDF printer embeds them in its own
+template unchanged.
+
+Text responses are gzipped at level 6 rather than level 1. For the same immutable files this
+drops KaTeX from 91 KB to 76 KB on the wire, highlight.js from 51 KB to 44 KB and app.js from
+38 KB to 31 KB; level 9 would save barely another 1%. The bottleneck here is the phone's link,
+not the server CPU, and the browser compresses each immutable asset only once per cache lifetime.
+
+Only the homepage-critical stylesheets (`style.css`, `reading-refresh.css` and `motion.css`)
+block the first paint. `article.css` (reader) and `briefing.css` (briefing view) are preloaded
+without blocking render and apply once fetched; neither view is shown until a click, so they are
+ready in time, and they are still request-stamped for year-long caching. The PDF printer embeds
+`article.css` in its own template, unaffected.
+
 Saved article HTML appears as soon as its request completes. Notes load concurrently;
 editing is enabled after they arrive, preserving existing notes. Saved articles skip
 the 3D download intro. On the homepage, only its module is preloaded: scene building,

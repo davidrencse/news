@@ -8,10 +8,9 @@ from __future__ import annotations
 from pathlib import Path
 
 
-TREES = ("Medium-Library", "notes", "CVEs", "search-index")
+TREES = ("Medium-Library", "notes", "Papers", "search-index")
 REQUIRED_FILES = (
     Path("Medium-Library/library.json"),
-    Path("CVEs/cvelistV5.sqlite3"),
     Path("search-index/medium.db"),
 )
 

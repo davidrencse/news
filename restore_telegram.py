@@ -81,6 +81,11 @@ def tgfs_modules():
 
 
 async def restore() -> None:
+    if os.environ.get("MEDIUM_LIBRARY_STORAGE", "telegram") != "local":
+        raise TelegramSetupError(
+            "Local restore is disabled in Telegram storage mode. The app reads Telegram directly. "
+            "For an intentional recovery export only, set MEDIUM_LIBRARY_STORAGE=local."
+        )
     session, Config, keyring_get = tgfs_modules()
     cfg = Config.load()
     secret = keyring_get() if cfg.encrypt else None

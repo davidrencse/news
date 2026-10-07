@@ -1,12 +1,17 @@
 <h1 align="center">Library of Babel</h1>
 
 <p align="center">
-  A personal reading room for articles, research, and vulnerability records.<br>
-  Keep long-form reading, notes, and CVE intelligence together.
+  A personal reading room for articles, research, and research papers.<br>
+  Keep long-form reading, notes, and papers together.
 </p>
 
 <p align="center">
-  <sub>A local Python app with a browser-based reader, optional Telegram backups, and on-demand CVE enrichment.</sub>
+  <sub>A local Python app with a browser-based reader, optional Telegram backups, and DOI-based research-paper lookups.</sub>
+</p>
+
+<p align="center">
+  <b>Setting it up for the first time, or restoring your library on a new machine?</b><br>
+  Start with the <a href="SETUP.md">step-by-step setup guide</a>. This README is the full feature reference.
 </p>
 
 ---
@@ -15,7 +20,7 @@
 
 - [Quick start](#run-it) · [Phone access](#on-your-phone) · [First session](#first-session)
 - [Run it](#run-it) · [How it works](#how-it-works)
-- [The library](#the-library) · [Discover and recommendations](#discover-and-recommendations) · [Reading, highlights, and notes](#reading-highlights-and-notes) · [Vulnerabilities](#vulnerabilities)
+- [The library](#the-library) · [Discover and recommendations](#discover-and-recommendations) · [Reading, highlights, and notes](#reading-highlights-and-notes) · [Research papers](#research-papers)
 - [Search](#search) · [The curator](#the-curator) · [Speed](#speed) · [Rate limits](#rate-limits)
 - [Settings](#settings) · [Files](#files)
 - [Storage and backups](#storage-and-backups) · [API](#api) · [Troubleshooting](#troubleshooting) · [Development checks](#checking-the-app-still-works)
@@ -26,7 +31,7 @@
 
 - Python **3.10 or newer**, available as `python` (or `python3` on macOS/Linux).
 - Chromium installed through Playwright for article rendering and PDF generation.
-- Internet access for installation, article downloads, indexing, and CVE imports.
+- Internet access for installation, article downloads, indexing, and research-paper lookups.
 - Writable disk space for articles, images, PDFs, and SQLite indexes. Usage grows with your library;
   the sitemap indexer pauses when its drive has less than 2 GB free.
 
@@ -38,7 +43,7 @@ Telegram is optional for the standalone setup below.
 > and launch with `run.bat`. The standalone commands create a separate local data set; they do not restore
 > your Telegram archive.
 
-### Standalone setup (Windows PowerShell)
+### Optional local-only setup (Windows PowerShell)
 
 Run these commands from the project directory:
 
@@ -46,6 +51,7 @@ Run these commands from the project directory:
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
+$env:MEDIUM_LIBRARY_STORAGE = "local"
 $env:MEDIUM_LIBRARY_DATA = Join-Path $env:LOCALAPPDATA "LibraryOfBabel"
 $env:HOST = "127.0.0.1"
 .\.venv\Scripts\python.exe app.py
@@ -61,6 +67,7 @@ same PowerShell window. Explicitly choosing a data directory keeps your library 
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m playwright install chromium
+export MEDIUM_LIBRARY_STORAGE=local
 export MEDIUM_LIBRARY_DATA="$HOME/.local/share/library-of-babel"
 export HOST=127.0.0.1
 .venv/bin/python app.py
@@ -72,51 +79,48 @@ Repeat the `export` assignments when launching from a new terminal.
 
 ### Existing Windows + Telegram setup
 
-`run.bat` connects this app to an existing Telegram File Storage System (TGFS) checkout. TGFS is a
-separate project: cloning this repository does not clone TGFS, create its Telegram session, or set
-up its encryption key. Those credentials and dependencies stay in TGFS and are **not** installed by
-this project's `requirements.txt`.
+**Telegram is the default and primary storage.** `run.bat` reads the library directly from
+Telegram into memory. It never restores a working copy to C: or E:. Article files are fetched
+on demand into memory, and edits are uploaded before the API reports success. A small
+`remote-state.json` overlay stores changed article records, deletions, and library settings
+without reuploading the entire original library on every edit.
 
-Before launching, clone/configure TGFS using its own setup instructions. Its checkout must have
-`src/tgfs`, a `.venv` with TGFS requirements installed, a working Telegram session, and the required
-encryption key in the TGFS-configured key store. The selected remote archive must already contain
-`Medium-Library`, `notes`, `CVEs`, and `search-index` under one archive root. The default root is
-`/newsletter-archive-2026-10-02`; set it to the archive path that actually holds your data.
-
-For example, in PowerShell, set paths for your machine and start the launcher from this repository:
+Configure the external TGFS checkout, its own Python environment, Telegram login and encryption
+key first. The default checkout is `~/Desktop/telegram-file-storage-system`; its current runtime
+requires Python 3.12+. The app's own Python remains compatible with 3.10+.
 
 ```powershell
-$env:TGFS_PROJECT = "C:\path\to\telegram-file-storage-system"
-$env:MEDIUM_LIBRARY_DATA = "E:\storage\newsletter-active"
+$env:TGFS_PROJECT = "$env:USERPROFILE\Desktop\telegram-file-storage-system"
 $env:TGFS_NEWSLETTER_PATH = "/newsletter-archive-2026-10-02"
+$env:HOST = "127.0.0.1"
 .\run.bat
 ```
 
-You can also double-click `run.bat` when using its defaults: the TGFS checkout at
-`%USERPROFILE%\Desktop\telegram-file-storage-system` and data cache at
-`E:\storage\newsletter-active` when the E: drive exists, otherwise `%LOCALAPPDATA%\LibraryOfBabel`.
-On the first app launch, the batch file creates the app's `.venv`,
-installs requirements, and downloads Chromium. If required cached files are absent, it restores
-from the configured archive and verifies the library, CVE catalog, search database, and notes folder
-before starting the app. If the local data directory already contains files but is incomplete, it
-asks before restoring because the archive can add or replace files there. The launcher waits until
-this app's page is ready before opening a browser, then uploads changed files only after a clean app
-exit. See [Storage and backups](#storage-and-backups) for the archive behavior.
+The archive must already contain `Medium-Library/library.json`. Missing or corrupt remote data
+stops startup; it never falls back to an empty local library. A large library takes time and RAM
+to load on each launch. The launcher allows 30 minutes for the initial Telegram read.
 
-The launcher uses those defaults only when `MEDIUM_LIBRARY_DATA` and `TGFS_PROJECT` are not already
-set in the environment; set them before running or edit the assignments to change those paths.
-Its browser address follows `HOST` and `PORT`; for `HOST=0.0.0.0` it opens the local loopback address.
-It refuses to open a different server already using that port. An existing `.venv` skips dependency installation, so after updating
-the project rerun the `pip install` and `playwright install` commands above.
+No content is cached on disk, even while running. TGFS still needs its small authentication
+session, encryption-key configuration, and file-location index; these are not article caches.
+Browser responses use `no-store`, and the replacement service worker removes this app's old
+content caches on its next activation. Code, dependencies, and Git history remain on disk.
+
+In this mode, search uses live feeds; local SQLite indexing, automatic curation, offline reading,
+and new PDF generation are disabled. Existing archived PDFs still open. New stories use an in-memory
+HTML reader; a page requiring JavaScript may need to be opened at its original site. Research-paper
+lookups, notes, topic edits, and saved links remain available.
 
 ## First session
+
+The steps below describe explicit local mode. Telegram mode saves HTML directly to Telegram,
+uses live feed search, and disables local indexing, PDF generation, and offline caching.
 
 1. Choose a topic and subtopic, paste a Medium article URL, and select **Add & read**.
 2. Wait for the download to finish. The reader saves article HTML, images, and a PDF locally.
 3. Select text to highlight it; use **Notes** for annotations and **Notebook** to review them later.
 4. Try **Discover** or search. The sitemap index builds in the background, so coverage improves over time.
 5. Open the index panel to adjust the indexing window, pause indexing, or disable automatic curation.
-6. Optionally open **Vulnerabilities** to import a CVE or start the complete catalog download.
+6. Optionally open **Research papers** and paste a DOI to add a paper to your shelf.
 
 Starting the server also starts the sitemap indexer and curator. Saving a link alone does not
 download its article, but these background services do make network requests.
@@ -267,22 +271,21 @@ Highlights, notes, and summaries live in `notes/<article id>.json`, so they surv
 moving an article. Very long articles can exceed Adobe Acrobat's 200-inch page limit, though browsers
 open them fine.
 
-## Vulnerabilities
+## Research papers
 
-Open **Vulnerabilities** in the sidebar and choose **Import complete CVE catalog** to download the
-official CVE List V5 baseline and its recent hourly deltas. The large first download runs in the
-background; its progress appears in the view. The searchable local index includes every CVE JSON 5
-record and preserves each complete source record, including CNA, CVE Program, and other ADP
-containers, affected versions, metrics, and references. Later updates use the repository's release
-deltas instead of downloading the full baseline again. Search by identifier, description, or year,
-open the complete canonical record, and add selected CVEs to your shelf.
+Open **Research papers** in the sidebar and paste a paper's **DOI** (a bare `10.xxxx/…`, a
+`https://doi.org/…` link, or a `doi:` prefix all work). The app resolves it through
+[Crossref](https://www.crossref.org/) and keeps the paper on your shelf with its title, authors,
+abstract, venue, year, type, and citation and reference counts. Open a card for the full abstract and
+details, follow the DOI to the publisher, or remove it from the shelf.
 
-The CVE List index is stored in `CVEs/cvelistV5.sqlite3`; manually enriched shelf records remain in
-`CVEs/cves.json`. Add a CVE ID or choose **Add to shelf** to also check NVD for CVSS, CPE, and
-references; CVE.org/MITRE; GitHub Advisories and OSV for package ranges and fixes; CISA KEV for
-known exploitation; and Red Hat, Microsoft MSRC, and Cisco. Each source is queried independently.
-If set, `NVD_API_KEY` is sent to NVD to use its higher request allowance; the public API is queried
-without a key otherwise.
+You can also **add by topic**: enter a query (e.g. `CVE software vulnerability`) and a count, and the
+app pulls that many relevance-ranked matches from Crossref and adds them in one write. arXiv-native
+`10.48550/…` DOIs are registered with DataCite, not Crossref, so a preprint without a published DOI
+will not resolve.
+
+Shelf records are stored in `Papers/papers.json`, carried in the Telegram archive alongside the rest
+of the library. Crossref is queried without an API key.
 
 ## Search
 
@@ -331,6 +334,31 @@ and appears above the Medium results.
 Local index searches make no requests to Medium. The live-feed fallback can make requests while
 the index is young or a query has no indexed results.
 
+## Morning briefing
+
+**Morning briefing** in the sidebar is an on-demand news scan, separate from your Medium library.
+Clicking it runs a four-stage pipeline in `briefing.py`, over a window you choose (24 hours, 3 days,
+or 7 days) ending at the moment you generate it:
+
+1. **Scan** — 60 topical Google News searches across AI, software, security, devices, business,
+   science, energy, world, space, and society, four at a time, each retried once on a transient error.
+2. **Select** — a deterministic, offline ranking: duplicate headlines merge, stories you already
+   follow (your topic names and Discover tags) get a modest capped boost, retellings of one event are
+   clustered so a single story cannot dominate, and the field is diversified across topics and
+   publishers down to the best 10, then the top 5.
+3. **Resolve** — best effort, for the shortlist only: Google News redirect links are turned into the
+   publisher's own URL (decoded where possible, otherwise by reading the landing page). The original
+   link is always a safe fallback.
+4. **Save** (optional) — **Save to library** on a pick fetches the publisher page, extracts a readable
+   copy with a small stdlib readability pass (no new dependencies), localizes its images, and files it
+   under **Custom → Morning Briefing** so it reads offline like any saved article. When the text cannot
+   be extracted, the story is still saved as a link to the original.
+
+The scan runs only when you ask; nothing is crawled in the background. Repeat clicks join the running
+scan, and a just-finished edition over the same window is reused rather than re-fetched. The window is
+fixed when you generate — use **Generate briefing** for a fresh edition. These are reading
+recommendations and links, not AI-written summaries or a fact-check of the articles.
+
 ## The curator
 
 While the server runs, `curator.py` keeps each subtopic stocked with trending member-only articles.
@@ -351,6 +379,9 @@ added or downloaded are kept, including free links explicitly requested through 
 
 ## Speed
 
+The disk, indexing, PDF, and browser-cache optimizations below apply to explicit local mode.
+Telegram mode trades these for zero local content cache.
+
 - **Library loading:** the home page requests at most 60 cards first, then loads counts and index status;
   count refreshes preserve existing card elements. Saved article HTML displays while notes load, and
   saved articles skip the 3D download intro. See [loading-performance.md](docs/loading-performance.md)
@@ -360,8 +391,8 @@ added or downloaded are kept, including free links explicitly requested through 
   up to 6 links during a maintenance cycle. Filling cycles wait 1 second; maintenance cycles wait
   60 seconds. Sitemap indexing adds only 0.25 seconds of idle time after each completed sitemap.
   All Medium/Freedium requests still use the existing shared rate limiter and backoff.
-- **CVE imports:** catalog writes commit in batches of 10,000 records. Enrichment already queries
-  all 8 sources concurrently. Catalog releases are applied in order so newer deltas win.
+- **Research-paper lookups** resolve a single DOI through Crossref on demand and write one small
+  JSON shelf; there is no bulk catalog or background import.
 - **Search** re-ranks a wide band of candidates in one pass, and consecutive pages rank the same
   band, so page 2 carries on exactly where page 1 stopped.
 - **Recommendations** are cached for 60 seconds, so switching labels and filters is instant; the
@@ -394,13 +425,13 @@ shells use `export NAME="value"`. Restart the server after changing them.
 
 | Setting | What |
 |---|---|
-| `FREEDIUM_BASE` | The mirror to use. Defaults to `https://freedium-mirror.cfd`; change it if that mirror goes down, e.g. `set FREEDIUM_BASE=https://freedium.cfd` |
+| `FREEDIUM_BASE` | The mirror to use. The public mirrors keep going down, so `run.bat` defaults this to a self-hosted Freedium at `http://localhost:6752` — see [docs/freedium-selfhost.md](docs/freedium-selfhost.md). Override it to point elsewhere, e.g. `set FREEDIUM_BASE=https://freedium.cfd` |
 | `PORT` | Server port. Defaults to `8765` |
 | `HOST` | Listen address. Defaults to `0.0.0.0` for phone access on your network; use `127.0.0.1` for this computer only |
-| `MEDIUM_LIBRARY_DATA` | Where PDFs, `library.json`, and the search index live |
+| `MEDIUM_LIBRARY_STORAGE` | `telegram` by default; `local` explicitly enables legacy local storage |
+| `MEDIUM_LIBRARY_DATA` | Data directory in explicit local mode only; ignored in Telegram mode |
 | `FREEDIUM_MIRRORS` | Comma-separated fallback mirrors, tried after `FREEDIUM_BASE`. A nonempty list replaces the built-in fallback of `https://freedium.cfd` |
 | `CHROMIUM_PATH` | Optional executable path to an existing Chromium browser; otherwise Playwright uses its installed browser |
-| `NVD_API_KEY` | Optional key sent with NVD enrichment requests; requests work without it at the public allowance |
 | `TGFS_PROJECT` | TGFS checkout used by the backup scripts; defaults to `~/Desktop/telegram-file-storage-system` |
 | `TGFS_NEWSLETTER_PATH` | Remote archive root used by the backup scripts; defaults to `/newsletter-archive-2026-10-02` |
 
@@ -422,7 +453,6 @@ on source latency and rate limits. The defaults are increased capacity limits, n
 | `CURATOR_CYCLE_SECONDS` | 60 | 1–3600 | Idle time after maintenance cycles (previously 120) |
 | `CURATOR_FAST_CYCLE_SECONDS` | 1 | 0.1–60 | Idle time after filling cycles (previously 3) |
 | `INDEX_REQUEST_GAP` | 0.25 | 0.1–60 | Extra idle time after each sitemap (previously 1.5 seconds) |
-| `CVE_IMPORT_BATCH_SIZE` | 10000 | 100–50000 | CVE records per database commit (previously 5000) |
 
 Worker counts and batch sizes must be integers; intervals accept decimals. Invalid values stop
 startup with an error naming the setting. Restart the server to apply changes. On a machine with
@@ -430,53 +460,24 @@ limited memory, set `ARTICLE_WORKERS=2` and `IMAGE_WORKERS=6` to restore the pre
 
 ## Storage and backups
 
-All paths below are relative to the active data directory:
+Telegram is authoritative in the default `telegram` mode. Library records are read into RAM,
+article content is fetched on demand, and changes are saved directly to Telegram along with a
+recoverable encrypted TGFS index snapshot. There is no restore-on-start or sync-on-exit cache.
+If Telegram fails, an edit returns an error; keep the process open and retry. Unacknowledged
+in-memory changes cannot survive a forced shutdown. Never run two library writers at once.
 
-```text
-<MEDIUM_LIBRARY_DATA>/
-  Medium-Library/
-    library.json                 # topics, saved links, reading history, dismissals
-    <topic>/<subtopic>/<title>/
-      content.html
-      article.pdf
-      images/
-  notes/<article-id>.json         # highlights, notes, summaries
-  search-index/medium.db          # sitemap search index
-  CVEs/
-    cvelistV5.sqlite3             # complete CVE catalog
-    cves.json                    # enriched CVEs saved to your shelf
-```
+The original library plus `Medium-Library/remote-state.json` together represent the current
+library. Keep both in a backup. Removed articles are hidden by tombstones; their original archived
+content remains recoverable. Legacy SQLite catalogs also remain archived without being downloaded.
 
-When `MEDIUM_LIBRARY_DATA` is unset, `app.py` first honors `data-location.txt` in the project
-directory, then defaults to the project directory itself. If that drive has less than 10 GB free
-and `E:\storage` exists, it moves eligible data folders to `E:\storage\medium-library` and records
-that location in the marker file. Set `MEDIUM_LIBRARY_DATA` explicitly to bypass this automatic choice.
+`sync_telegram.py` is now a one-time migration/maintenance tool for old local data, not a normal
+launch step. `restore_telegram.py` refuses to create a cache unless explicitly run with
+`MEDIUM_LIBRARY_STORAGE=local` for recovery. Do not delete an old working copy until every file
+has a verified Telegram upload and the TGFS index has been backed up.
 
-For a manual backup, stop the server cleanly and copy all four data folders together. To restore
-that backup, place them under your chosen data directory and point `MEDIUM_LIBRARY_DATA` there.
-Keep the article IDs in `library.json` together with their note files.
-
-The optional TGFS scripts use `E:\storage\newsletter-active` when `MEDIUM_LIBRARY_DATA` is unset;
-they do not use the app's marker-file logic. Encryption follows the external TGFS configuration.
-`restore_telegram.py` retrieves all four trees, so back up an existing local library before restoring
-over it. `sync_telegram.py` compares file size and SHA-256, uploads new or changed files, and saves an
-index snapshot when anything changes. It does **not** propagate local deletions to the archive.
-All four local trees must exist for sync to complete.
-
-To run these scripts manually, stop the app, set the same data directory used by the app, and use
-the configured TGFS environment (PowerShell example):
-
-```powershell
-$env:MEDIUM_LIBRARY_DATA = "E:\storage\newsletter-active"
-$env:TGFS_PROJECT = Join-Path $env:USERPROFILE "Desktop\telegram-file-storage-system"
-& "$env:TGFS_PROJECT\.venv\Scripts\python.exe" sync_telegram.py
-# Recovery only: downloads the archive into MEDIUM_LIBRARY_DATA.
-# & "$env:TGFS_PROJECT\.venv\Scripts\python.exe" restore_telegram.py
-```
-
-Automatic sync depends on the launcher reaching its post-exit step. A crash, forced termination,
-or closed terminal can prevent it. A failed upload leaves the local data intact; rerun sync after
-resolving the TGFS error. Launching `app.py` directly does not restore or sync Telegram data.
+Explicit local mode is retained for offline tests and standalone use only:
+`MEDIUM_LIBRARY_STORAGE=local` plus `MEDIUM_LIBRARY_DATA` selects local files. `run.bat` always
+selects Telegram mode regardless of those old data-path settings.
 
 ## API
 
@@ -496,8 +497,13 @@ unauthenticated access as the UI; write operations in the API explorer change th
 | `PUT /api/articles/{aid}/notes` | Save annotations |
 | `GET /api/notebook` | Collect notebook entries |
 | `GET /api/index` | Inspect indexing and curator status |
-| `GET /api/cves/catalog/status` | Inspect catalog import progress |
-| `POST /api/cves/catalog/sync` | Start a CVE catalog update |
+| `GET /api/briefing` | Read the current morning-briefing scan (or `idle`) |
+| `POST /api/briefing` | Start a scan (`{"days": 1\|3\|7, "force": bool}`) |
+| `POST /api/briefing/save` | Save a briefing pick to the library |
+| `GET /api/papers` | List research papers on your shelf |
+| `POST /api/papers/import` | Resolve a DOI through Crossref and add it (`{"doi": "10.…"}`) |
+| `POST /api/papers/search_import` | Add Crossref matches for a topic (`{"query": "…", "rows": 50}`) |
+| `DELETE /api/papers/{id}` | Remove a paper from your shelf |
 
 For example, in PowerShell:
 
@@ -520,11 +526,10 @@ Invoke-RestMethod "http://127.0.0.1:8765/api/search?q=vector%20database"
 | `polite.py` | One self-throttling HTTP client for every outside request |
 | `performance.py` | Validated environment settings for worker counts, batches, and background cadence |
 | `topics.py` | Default topic tree and Medium tags per subtopic |
-| `cve_sources.py` | On-demand CVE enrichment from NVD, CVE.org/MITRE, GitHub, CISA KEV, OSV, Red Hat, Microsoft, and Cisco |
-| `cve_catalog.py` | Full CVE List V5 baseline and hourly delta ingestion, SQLite search, canonical records |
+| `paper_sources.py` | Resolve a DOI to paper metadata (title, authors, abstract, venue) through Crossref |
 | `static/` | The UI, Babel animation, web-app manifest, icons and service worker |
 | `Medium-Library/` | Your articles, plus `library.json` |
-| `CVEs/` | `cvelistV5.sqlite3` full catalog and `cves.json` enriched shelf records |
+| `Papers/` | `papers.json` research-paper shelf records |
 | `notes/` | Highlights, notes, and summaries, one file per article |
 | `selftest.py` | Offline self-test of the library API, search index, renderer and curator |
 | `run.bat` | Windows launcher for the existing E: drive and TGFS setup |
@@ -574,8 +579,8 @@ Playwright Chromium):
 ```
 
 On macOS/Linux, use `.venv/bin/python` in place of `.\.venv\Scripts\python.exe`.
-`test_performance.py` checks tuning validation and a CVE import spanning a full batch plus a
-partial batch, including searchable records. It uses temporary data and requires no network or browser.
+`test_performance.py` checks pipeline-setting validation, source cooldown behavior, and backup
+fingerprint reuse. It uses temporary data and requires no network or browser.
 `test_telegram_setup.py` checks TGFS paths and restored-file validation using temporary fixtures; it
 does not load TGFS credentials or connect to Telegram.
 

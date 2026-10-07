@@ -115,7 +115,9 @@ DEFAULT_TREE = [
         ("energy", "Energy", ["nuclear-energy", "energy"]),
         ("research", "Research", ["science", "research"]),
     ]),
-    ("custom", "Custom", []),
+    ("custom", "Custom", [
+        ("morning-briefing", "Morning Briefing", []),  # where saved briefing picks are filed
+    ]),
 ]
 
 

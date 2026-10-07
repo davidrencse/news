@@ -12,6 +12,7 @@ import time
 
 WORK = tempfile.mkdtemp(prefix="medium-library-selftest-")
 os.environ["MEDIUM_LIBRARY_DATA"] = WORK
+os.environ["MEDIUM_LIBRARY_STORAGE"] = "local"
 
 # The Freedium route is pointed at a stub server on localhost (started below), with a dead host first
 # so the mirror fallback is exercised. FREEDIUM_MIRRORS replaces the public fallback, so no test can
@@ -773,8 +774,10 @@ def test_phone_ui():
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(**({"executable_path": _pipeline.CHROMIUM_PATH}
                                               if _pipeline.CHROMIUM_PATH else {}))
+        # bypass_csp lets Playwright's own wait_for_function/evaluate run; the app still SENDS its CSP,
+        # so this does not weaken what a real browser enforces — it only unblocks the test harness.
         ctx = await browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True,
-                                        has_touch=True, device_scale_factor=2)
+                                        has_touch=True, device_scale_factor=2, bypass_csp=True)
         page = await ctx.new_page()
         await page.add_init_script("localStorage.setItem('babelIntro', 'false')")
         requests = []
@@ -785,7 +788,7 @@ def test_phone_ui():
             await page.wait_for_selector(".card", timeout=15000)
             out = {}
             out["first_render_seconds"] = time.perf_counter() - started
-            out["cves_deferred"] = not any(url.endswith("/api/cves") for url in requests)
+            out["papers_deferred"] = not any(url.endswith("/api/papers") for url in requests)
             first_card = await page.locator(".card").first.evaluate_handle("el => el")
             await page.evaluate("refreshLibraryMeta()")
             out["metadata_keeps_existing_cards"] = await first_card.evaluate("el => el.isConnected")
@@ -872,7 +875,7 @@ def test_phone_ui():
     check("the page never scrolls sideways", r["no_sideways_scroll"])
     check("the library's first cards render within the local-load budget",
           r["first_render_seconds"] < 8.0, f"{r['first_render_seconds']:.2f}s (budget 8s)")
-    check("opening the library defers the saved CVE payload", r["cves_deferred"])
+    check("opening the library defers the saved research-paper payload", r["papers_deferred"])
     check("refreshing library counts preserves rendered cards", r["metadata_keeps_existing_cards"])
     check("the first library page stays capped at 60 cards", r["first_page_count"] == 60,
           r["first_page_count"])
@@ -997,7 +1000,7 @@ def test_offline_reading():
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(**({"executable_path": _pipeline.CHROMIUM_PATH}
                                               if _pipeline.CHROMIUM_PATH else {}))
-        ctx = await browser.new_context(service_workers="allow")
+        ctx = await browser.new_context(service_workers="allow", bypass_csp=True)
         page = await ctx.new_page()
         out = {}
         try:
@@ -1140,7 +1143,7 @@ def test_notes_survive_backgrounding():
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(**({"executable_path": _pipeline.CHROMIUM_PATH}
                                               if _pipeline.CHROMIUM_PATH else {}))
-        ctx = await browser.new_context()
+        ctx = await browser.new_context(bypass_csp=True)
         page = await ctx.new_page()
         notes_requested = asyncio.Event()
         release_notes = asyncio.Event()
@@ -1383,7 +1386,8 @@ def test_morning_briefing():
         time.sleep(0.02)
         return fixture_fetch(*args)
 
-    service = BriefingService(fetch)
+    # A fixture resolver exercises the resolve stage deterministically (no real Google News fetch).
+    service = BriefingService(fetch, resolver=lambda u: u.replace("://example.com", "://resolved.example"))
     with patch.object(A, "briefing_service", service):
         client = TestClient(A.app)
         check("briefing starts idle", client.get("/api/briefing").json()["state"] == "idle")
@@ -1395,7 +1399,9 @@ def test_morning_briefing():
                 if service.snapshot()["state"] != "running":
                     break
                 time.sleep(0.02)
-            check("briefing API produces five picks", len(service.snapshot()["articles"]) == 5)
+            picks = service.snapshot()["articles"]
+            check("briefing API produces five picks", len(picks) == 5)
+            check("briefing resolves pick urls to the publisher", all("resolved.example" in a["resolved_url"] for a in picks))
             service.stop()
             return
         from playwright.sync_api import sync_playwright
@@ -1423,6 +1429,9 @@ def test_morning_briefing():
                     check("briefing exposes its ten-article shortlist", page.locator('.briefing-story-compact').count() == 10)
                     page.get_by_text('See the top 10 shortlist', exact=True).click()
                     check("briefing links open safely", page.locator('.briefing-picks h2 a').first.get_attribute('rel') == 'noopener noreferrer')
+                    check("pick links use the resolved publisher url",
+                          "resolved.example" in (page.locator('.briefing-picks h2 a').first.get_attribute('href') or ""))
+                    check("each pick offers a save-to-library action", page.locator('.briefing-picks [data-save]').count() == 5)
                     page.screenshot(path=os.path.join(tempfile.gettempdir(), 'newsletter-briefing-desktop.png'), full_page=True)
                     page.locator('#briefingDays').select_option('7')
                     page.get_by_role('button', name='Generate briefing', exact=True).click()
@@ -1434,7 +1443,11 @@ def test_morning_briefing():
                     page.screenshot(path=os.path.join(tempfile.gettempdir(), 'newsletter-briefing-mobile.png'), full_page=True)
                     page.locator('#menuBtn').click()
                     page.locator('[data-t=""][data-s=""]').click()
-                    check("briefing can return to the library", page.locator('h1').inner_text() == 'All articles')
+                    # The All-articles home shows the library hero (not a plain "All articles" heading),
+                    # and its tree item becomes the active selection; both confirm we left the briefing.
+                    page.locator('.home-intro').wait_for(timeout=20000)
+                    check("briefing can return to the library",
+                          page.locator('[data-t=""][data-s=""].active').count() == 1)
                 finally:
                     browser.close()
         finally:

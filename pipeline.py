@@ -105,9 +105,13 @@ def localize_images(content, out_dir):
     def fetch(item):
         i, url = item
         try:
-            data = polite.get(url, timeout=30, priority=True)
-            ext = next((e for magic, e in MAGIC if data.startswith(magic)), None) \
-                or os.path.splitext(urlsplit(url).path)[1][:5] or ".img"
+            # Cap the download and trust only magic bytes, matching save_remote_document (the Telegram
+            # path). Otherwise a mislabelled URL streams gigabytes into RAM, and a non-image response
+            # (e.g. from an SSRF to a loopback service) gets saved as .html/.js under the served /files/.
+            data = polite.get(url, timeout=30, priority=True, max_bytes=20 * 1024 * 1024)
+            ext = next((e for magic, e in MAGIC if data.startswith(magic)), None)
+            if ext not in (".png", ".jpg", ".gif", ".webp"):
+                return url, None  # not a recognized image: keep the online URL, never save arbitrary content
             os.makedirs(os.path.join(out_dir, "images"), exist_ok=True)
             with open(os.path.join(out_dir, "images", f"{i:03d}{ext}"), "wb") as f:
                 f.write(data)
@@ -162,30 +166,39 @@ class PdfPipeline:
                 await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._drop_browser(), self._loop))
 
     async def _drop_browser(self):
-        """Throw away the current browser so the next render launches a fresh one."""
-        browser, self._browser = self._browser, None
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass  # it is already gone; that is why we are here
+        """Discard the shared browser only if it has actually crashed. A per-page error leaves the
+        browser connected and still serving the other concurrent renders, so closing it then would kill
+        them all with TargetClosedError and cascade into 'PDF engine failed twice'. is_connected() and
+        the identity check run without awaiting, so a concurrent relaunch can't be clobbered mid-decision."""
+        browser = self._browser
+        if browser is None or browser.is_connected():
+            return
+        if self._browser is browser:  # don't null a fresh browser a concurrent retry already launched
+            self._browser = None
+        try:
+            await browser.close()
+        except Exception:
+            pass  # it is already gone; that is why we are here
 
     async def _ensure_browser(self):
         # One launch at a time: without this, simultaneous downloads each start their own Chromium
         # and all but the last are orphaned for the life of the process.
         async with self._launching:
-            if self._browser is not None and self._browser.is_connected():
-                return
-            if self._pw is None:
-                self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(
-                **({"executable_path": CHROMIUM_PATH} if CHROMIUM_PATH else {}))
-            self._sem = self._sem or asyncio.Semaphore(MAX_PARALLEL)
+            if self._browser is None or not self._browser.is_connected():
+                if self._pw is None:
+                    self._pw = await async_playwright().start()
+                self._browser = await self._pw.chromium.launch(
+                    **({"executable_path": CHROMIUM_PATH} if CHROMIUM_PATH else {}))
+                self._sem = self._sem or asyncio.Semaphore(MAX_PARALLEL)
+            return self._browser
 
     async def _render(self, medium_url, out_dir, on_stage):
-        await self._ensure_browser()
+        # Capture the browser: between here and new_context another render's crash may null self._browser,
+        # and reading it there would raise AttributeError. A captured-but-closed browser instead raises a
+        # Playwright error that render()'s retry handles cleanly.
+        browser = await self._ensure_browser()
         async with self._sem:
-            ctx = await self._browser.new_context(viewport={"width": PAGE_WIDTH_PX, "height": 1123}, color_scheme="light")
+            ctx = await browser.new_context(viewport={"width": PAGE_WIDTH_PX, "height": 1123}, color_scheme="light")
             try:
                 page = await ctx.new_page()
                 # Free stories come straight from Medium; only paywalled or refused ones go through Freedium.
@@ -214,7 +227,10 @@ class PdfPipeline:
                 await self._print(page, content, out_dir)
                 return dict(meta, route=route["route"], reason=route.get("reason", "free story"))
             finally:
-                await ctx.close()
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass  # the browser may have died mid-render; don't let cleanup mask the real error
 
     async def _from_freedium(self, page, medium_url, on_stage=None):
         """Try each mirror in turn; a dead or empty one must not end the paywalled route."""

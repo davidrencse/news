@@ -142,3 +142,43 @@ were not selected because they do not address this app's stack or the observed g
 
 Suggested order: cooldown correctness and queue bounds; shared CVE enrichment and
 FTS delta updates; profiling cache invalidation; then tune worker counts using evidence.
+
+## Resolution status (2026-10-04, follow-up)
+
+Fixes landed in this pass, each with a regression test where behaviour could be pinned offline
+(`test_performance.py`):
+
+- **Finding 1 — cooldowns (fixed).** `polite.HostLimiter.pushed_back` now honours a server
+  `Retry-After` exactly instead of capping it at `MAX_GAP`; `MAX_GAP` still caps only the adaptive
+  gap and the no-`Retry-After` fallback. `wait()` reserves its slot once, then re-checks the shared
+  `pause_until` after sleeping so a cooldown announced mid-sleep is respected before dispatch. Tests:
+  `CooldownTests`.
+- **Finding 3 — CVE enrichment (fixed).** One shared bounded pool (8 workers) replaces a fresh pool
+  per import, and the whole-catalog KEV/Cisco feeds are fetched through a TTL cache that coalesces
+  concurrent misses, so N concurrent imports no longer run 8N fetches or re-download the same feeds.
+  Tests: `CVEFeedCacheTests`.
+- **Finding 5 — whole-library work (partly fixed).** `Store.flush` now serialises compact JSON
+  (≈5.1 s/190 MB → 1.4 s/126 MB at 520k rows). `Recommender.profile` memoises the legacy
+  notes-file probe per id instead of reading it on every rebuild. The remaining part —
+  `_library_page_index` rebuilding all counts/scopes on each version bump (≈790 ms cold at 520k,
+  of which ≈170 ms is the load-bearing snapshot copy) — still wants incremental counts / narrower
+  invalidation, which the finding already scopes as a measured change.
+- **Finding 7 — backup hashing (fixed).** `sync_telegram` keeps a persisted (size, mtime) fingerprint
+  cache so unchanged files skip re-hashing; stale entries are pruned and `TGFS_VERIFY_ALL=1` forces a
+  full re-hash. Tests: `BackupFingerprintTests`.
+
+Also added this pass (admission/backpressure, previously finding 2):
+
+- **Finding 2 — pending queue (fixed).** `fetch_article` now rejects with HTTP 503 once
+  `MAX_ACTIVE_FETCHES` (default 64, validated in `performance.py`) downloads are already in flight,
+  bounding queued tasks, job records, and retained article references. Deduplicated re-requests for a
+  download already running are unaffected.
+
+Still open, deliberately, because each needs a schema migration or evidence the audit itself calls for:
+
+- **Finding 4 — CVE delta FTS.** A real fix means an external-content FTS5 table keyed by `rowid`
+  (and reworked search JOINs), plus the migration/consistency testing the finding specifies. Deleting
+  by the `UNINDEXED id` column inherently scans; no safe zero-migration shortcut exists. Note the scan
+  only runs on delta imports, not the full-rebuild path.
+- **Finding 6 — worker-count baseline.** A measurement task (throughput/memory under fixed fixtures),
+  not a code change.

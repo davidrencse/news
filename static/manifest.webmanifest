@@ -1,7 +1,7 @@
 {
   "name": "Library of Babel",
   "short_name": "Babel",
-  "description": "A personal library for articles, research, and vulnerability records.",
+  "description": "A personal library for articles, research, and research papers.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

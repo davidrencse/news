@@ -153,18 +153,71 @@ class TelegramSetupTests(unittest.TestCase):
         self.assertEqual(launch_app.local_url("0.0.0.0", 1234), "http://127.0.0.1:1234/")
         self.assertEqual(launch_app.local_url("::1", 1234), "http://[::1]:1234/")
 
+    def test_sync_checkpoints_index_periodically(self):
+        # A long sync must snapshot the index during the run, not only at the end, so a crash orphans
+        # at most BACKUP_EVERY uploads instead of the whole run. 5 uploads at BACKUP_EVERY=2 => snapshots
+        # after #2 and #4, plus a final flush for #5 = 3 (before this it was a single end-of-run backup).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for tree in ("Medium-Library", "search-index", "notes", "Papers"):
+                (root / tree).mkdir()
+            (root / "Medium-Library" / "library.json").write_bytes(b"{}")
+            (root / "search-index" / "medium.db").write_bytes(b"db")
+            for i in range(3):
+                (root / "Medium-Library" / f"x{i}").write_bytes(f"data{i}".encode())
+
+            class FakeIndex:
+                def resolve(self, _path):
+                    return None  # nothing exists remotely yet, so every file uploads
+                def mkdir(self, _path, parents=False, exist_ok=False):
+                    pass
+
+            class FakeStorage:
+                def __init__(self):
+                    self.index, self.puts, self.backups = FakeIndex(), 0, 0
+                async def put(self, _local, _remote):
+                    self.puts += 1
+                async def backup_index(self):
+                    self.backups += 1
+                    return self.backups
+
+            class FakeCM:
+                def __init__(self, storage):
+                    self.storage = storage
+                async def __aenter__(self):
+                    return self.storage
+                async def __aexit__(self, *_a):
+                    return False
+
+            storage = FakeStorage()
+            cfg = SimpleNamespace(encrypt=False)
+            modules = (SimpleNamespace(load=lambda: cfg), lambda *a, **k: FakeCM(storage), lambda: None)
+            saved = {k: getattr(sync_telegram, k) for k in
+                     ("DATA_ROOT", "FINGERPRINT_FILE", "BACKUP_EVERY", "tgfs_modules")}
+            sync_telegram.DATA_ROOT = root
+            sync_telegram.FINGERPRINT_FILE = root / ".tgfs-fingerprints.json"
+            sync_telegram.BACKUP_EVERY = 2
+            sync_telegram.tgfs_modules = lambda: modules
+            try:
+                asyncio.run(sync_telegram.sync())
+            finally:
+                for key, value in saved.items():
+                    setattr(sync_telegram, key, value)
+            self.assertEqual(storage.puts, 5)
+            self.assertEqual(storage.backups, 3)
+
     def test_complete_restore_passes_local_file_checks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for rel in (
                 "Medium-Library/library.json",
-                "CVEs/cvelistV5.sqlite3",
                 "search-index/medium.db",
             ):
                 path = root / rel
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"fixture")
             (root / "notes").mkdir()
+            (root / "Papers").mkdir()
             require_restored_data(root)
             self.assertEqual(missing_data(root), [])
 

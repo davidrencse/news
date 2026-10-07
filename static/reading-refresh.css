@@ -132,11 +132,9 @@ input, textarea, select { accent-color: var(--accent); caret-color: var(--accent
 .hl-item .hl-note { color: var(--muted); }
 .nb-entry { max-width: none; padding: 20px 4px; }
 .nb-title { font-size: 19px; }
-.cve-card { max-width: 900px; padding: 17px 4px; }
-.cve-card-main { gap: 9px 12px; }
-.cve-id { font-variant-numeric: tabular-nums; }
-.cve-description { line-height: 1.55; }
-.cve-page { border-top-color: var(--line); }
+.paper-card { max-width: 860px; padding: 18px 4px; }
+.paper-card-main { gap: 6px; }
+.paper-abstract { line-height: 1.55; }
 .dlg { border-radius: 10px; border-color: var(--line); background: var(--panel); box-shadow: var(--shadow); }
 .dlg form { padding: 24px; }
 .toast { border-radius: 8px; background: var(--ink); box-shadow: var(--shadow); }
@@ -260,9 +258,6 @@ input, textarea, select { accent-color: var(--accent); caret-color: var(--accent
     --tok-title: #fff; --tok-type: #ccc; --tok-attr: #eee; --tok-meta: #999;
     color-scheme: dark;
   }
-}
-.cve-kev, .cve-score.sev-critical, .cve-score.sev-high, .cve-score.sev-medium {
-  color: var(--ink); background: var(--accent-soft); border: 1px solid var(--line);
 }
 .babel { background: #000; }
 .babel-place, .babel-status, .babel-skip { color: #fff; text-shadow: 0 1px 8px #000; }

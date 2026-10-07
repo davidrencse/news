@@ -13,12 +13,16 @@ search-index/*.db-wal
 # Atomic-write scratch files
 *.tmp
 .tmp-bulk-100k/
+.tmp-telegram-retirement.json
+.tmp-remote-live.py
+.tmp-selftest-storage.log
 
 # Your library: articles, PDFs, reading history, highlights and the search index.
 # Personal data and other people's copyrighted articles — never commit these.
 Medium-Library/
 notes/
 search-index/
+Papers/
 data-location.txt
 
 # Local editor/launch config, which carries absolute paths from your machine

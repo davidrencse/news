@@ -2,8 +2,8 @@
    Loaded last so it re-animates the quiet base from reading-refresh.css.
    Everything here is progressive: content is fully visible without it, and
    the global prefers-reduced-motion rule (reading-refresh.css) zeroes it out.
-   Skiper UI (free tier) inspired the theme-toggle reveal (skiper4) and the
-   underline wipe (skiper40); both are reimplemented in native CSS/SVG.
+   Skiper UI (free tier) inspired the theme-toggle reveal (skiper4),
+   reimplemented in native CSS/SVG.
    Credit: Skiper UI — https://skiper-ui.com (free components, attribution). */
 :root {
   /* overshoot spring for entrances and the active-nav marker */
@@ -11,7 +11,7 @@
     1.017, 1.077 21%, 1.121, 1.149 24.3%, 1.159, 1.163, 1.161, 1.154 29.9%,
     1.129 32.8%, 1.051 39.6%, 1.017 43.1%, 0.991, 0.977 51%, 0.975 57.1%,
     0.997 69.8%, 1.003 76.9%, 1);
-  /* crisp ease-out for underline wipes and hover lifts */
+  /* crisp ease-out for hover lifts */
   --m-ease: cubic-bezier(.22, .61, .36, 1);
 }
 
@@ -19,7 +19,7 @@
 @keyframes m-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 
 .list > .card,
-.list > .cve-card,
+.list > .paper-card,
 .list > .nb-entry {
   animation: m-rise .5s var(--m-spring) both;
 }
@@ -36,24 +36,6 @@
 
 /* the home intro and view head settle in too, so a mode switch feels composed */
 .view-head, .home-intro { animation: m-rise .45s var(--m-ease) both; }
-
-/* ---- Skiper40 underline wipe: enters from the left, exits to the right ----- */
-.card-title, .home-source > span, .nb-title, .tab, .tree-item > span:first-child {
-  position: relative;
-}
-.card-title::after,
-.home-source > span::after,
-.nb-title::after {
-  content: ""; position: absolute; left: 0; right: 0; bottom: -3px; height: 1.5px;
-  background: currentColor; transform: scaleX(0); transform-origin: right;
-  transition: transform .4s var(--m-ease);
-}
-.card:hover .card-title::after,
-.card:focus-within .card-title::after,
-.home-source:hover > span::after,
-.nb-entry:hover .nb-title::after {
-  transform: scaleX(1); transform-origin: left;
-}
 
 /* ---- Active nav marker slides between topics (spring) ---------------------- */
 .tree-item { position: relative; }

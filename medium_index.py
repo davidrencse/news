@@ -148,22 +148,26 @@ class MediumIndex:
             try:
                 self.crawl_day(day, url, lastmod)
                 self.state["error"] = None
+                self.__dict__.get("_fails", {}).pop(day, None)  # a success clears this day's strike count
             except urllib.error.HTTPError as e:
                 self.state["error"] = f"Medium answered HTTP {e.code}; waiting before retrying"
-                if e.code not in (429, 503):
+                if e.code in (404, 410):  # this day's sitemap is genuinely gone: record empty and move on
                     self._give_up_after_retries(day, url, lastmod)
                 self._sleep(300 if e.code in (429, 503) else 60)
                 continue
             except Exception as e:
+                # Transient failures (network, timeout, 403/5xx block, a locked DB) must NOT record the
+                # day as empty — that permanently drops its posts, because _pending only revisits recent
+                # days when lastmod changes. Leave the day pending and retry it.
                 self.state["error"] = f"{type(e).__name__}: {e}"
-                self._give_up_after_retries(day, url, lastmod)
                 self._sleep(60)
                 continue
             self._sleep(REQUEST_GAP)
 
     def _give_up_after_retries(self, day, url, lastmod, limit=3):
-        """The newest pending day is always retried first, so one day that fails every time would stall
-        the whole crawl. After a few tries it is recorded as crawled with no posts and the crawl moves on."""
+        """A day whose sitemap is genuinely gone (HTTP 404/410) is retried a few times, then recorded as
+        crawled with no posts so a permanently missing day cannot stall the newest-first crawl. Transient
+        failures never reach here, so a network blip or block can no longer drop a day's posts."""
         fails = self.__dict__.setdefault("_fails", {})  # day -> consecutive failures
         fails[day] = fails.get(day, 0) + 1
         if fails[day] >= limit:

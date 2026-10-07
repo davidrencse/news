@@ -16,7 +16,6 @@ needed for the task; do not load this entire catalog for every edit.
 | Slow Python code, memory growth, throughput, caching | [python-performance-optimization](.agents/skills/python-performance-optimization/SKILL.md) | Profile library pagination, recommendation rebuilding, JSON persistence, image handling, and backup hashing before changing limits |
 | Download jobs, background work, thread pools, shutdown, cancellation | [async-python-patterns](.agents/skills/async-python-patterns/SKILL.md) | Bound queued as well as running work; preserve the dedicated Playwright event loop and Windows subprocess support |
 | Search/index latency, CVE imports, SQLite contention | [sql-optimization-patterns](.agents/skills/sql-optimization-patterns/SKILL.md) | Use SQLite `EXPLAIN QUERY PLAN`, FTS5-aware updates, and measured batching; the skill's PostgreSQL syntax and index types are not applicable here |
-| Reader, mobile layout, service worker, browser regressions | [webapp-testing](.agents/skills/webapp-testing/SKILL.md) | Use Python Playwright with localhost fixtures; verify actual offline article and library behavior, not just successful worker registration |
 
 For UI design or rendering-performance work, use the installed `impeccable` skill
 when available and preserve `PRODUCT.md`. It is user-installed, not bundled here.

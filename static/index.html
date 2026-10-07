@@ -16,12 +16,18 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="theme-color" content="#f7f7f3" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#171d1a" media="(prefers-color-scheme: dark)">
-  <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
-  <link rel="stylesheet" href="/static/article.css">
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/reading-refresh.css">
-  <link rel="stylesheet" href="/static/briefing.css">
   <link rel="stylesheet" href="/static/motion.css">
+  <!-- article.css (reader) and briefing.css (briefing view) aren't needed for the homepage's first
+       paint, so they load without blocking render and apply once fetched. Neither view is shown until
+       a click, so they are ready in time; app.py still stamps these hrefs for year-long caching. -->
+  <link rel="preload" href="/static/article.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="/static/briefing.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <noscript>
+    <link rel="stylesheet" href="/static/article.css">
+    <link rel="stylesheet" href="/static/briefing.css">
+  </noscript>
   <script>
     // applied before paint so a saved theme doesn't flash; app.js owns the toggle
     try { const t = JSON.parse(localStorage.getItem('theme')); if (t) document.documentElement.dataset.theme = t; } catch {}
@@ -33,7 +39,7 @@
   <aside id="sidebar" class="sidebar">
     <div class="brand">
       <span class="logo" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M7 7.5h18v17H7z"/><path d="M11 12h10M11 16h10M11 20h6"/><circle cx="24" cy="8" r="3"/></svg></span>
-      <div><b>Library of Babel</b><small>articles · research · CVEs</small></div>
+      <div><b>Library of Babel</b><small>articles · research · papers</small></div>
       <button id="themeBtn" class="btn ghost icon theme-btn" title="Toggle light/dark mode" aria-label="Toggle light/dark mode">◐</button>
       <button id="babelBtn" class="btn ghost icon babel-btn" aria-label="Library of Babel intro" aria-pressed="false" hidden>⬡</button>
     </div>
@@ -96,9 +102,8 @@
   <button data-act="copy" title="Copy the selected text">Copy</button>
 </div>
 <div id="hlPop" class="hl-pop" hidden></div>
-<script defer src="/static/vendor/katex/katex.min.js"></script>
-<script defer src="/static/vendor/katex/auto-render.min.js"></script>
-<script defer src="/static/vendor/hljs/highlight.min.js"></script>
+<!-- KaTeX (~272 KB) and highlight.js (~129 KB) are only needed inside the reader, so they are
+     loaded on demand by app.js when an article is first opened, not on every homepage visit. -->
 <script defer src="/static/article.js"></script>
 <script defer src="/static/app.js"></script>
 <script defer src="/static/briefing.js"></script>

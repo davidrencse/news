@@ -26,14 +26,18 @@ from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 import polite
-import cve_sources
-from cve_catalog import CVECatalog
-from briefing import BriefingService
+import paper_sources
+from briefing import (BriefingService, interest_tokens, news_document, resolve_article_url)
+from briefing import fetch_article as fetch_news_article  # app.py already has a fetch_article route
 from curator import Curator
 from medium_index import MediumIndex
-from pipeline import PdfPipeline, PipelineError
+from performance import MAX_ACTIVE_FETCHES
+from pipeline import PdfPipeline, PipelineError, localize_images
 from recommender import Recommender
 from topics import default_topics
+from telegram_storage import RemoteFiles, safe_relative
+from remote_library import (remote_store_type, RemotePapers, RemoteIndex,
+                            remote_curator_type)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FALLBACK_STORAGE = r"E:\storage"
@@ -56,7 +60,7 @@ def choose_data_dir():
         return ROOT
     target = os.path.join(FALLBACK_STORAGE, "medium-library")
     os.makedirs(target, exist_ok=True)
-    for name in ("Medium-Library", "search-index", "notes", "CVEs"):
+    for name in ("Medium-Library", "search-index", "notes", "Papers"):
         src, dst = os.path.join(ROOT, name), os.path.join(target, name)
         if os.path.exists(src) and not os.path.exists(dst):
             shutil.move(src, dst)
@@ -66,11 +70,15 @@ def choose_data_dir():
     return target
 
 
-DATA_DIR = choose_data_dir()
+STORAGE_MODE = os.environ.get("MEDIUM_LIBRARY_STORAGE", "telegram")
+if STORAGE_MODE not in ("telegram", "local"):
+    raise RuntimeError("MEDIUM_LIBRARY_STORAGE must be telegram or local")
+REMOTE = RemoteFiles() if STORAGE_MODE == "telegram" else None
+# A virtual path only; remote mode never calls choose_data_dir or creates these directories.
+DATA_DIR = "__telegram_only__" if REMOTE else choose_data_dir()
 LIBRARY_DIR = os.path.join(DATA_DIR, "Medium-Library")
 DB_PATH = os.path.join(LIBRARY_DIR, "library.json")
-CVE_DB_PATH = os.path.join(DATA_DIR, "CVEs", "cves.json")
-CVE_CATALOG_PATH = os.path.join(DATA_DIR, "CVEs", "cvelistV5.sqlite3")
+PAPER_DB_PATH = os.path.join(DATA_DIR, "Papers", "papers.json")
 STATIC_DIR = os.path.join(ROOT, "static")
 NOTES_DIR = os.path.join(DATA_DIR, "notes")  # highlights + notes per article, kept apart from downloads
 FEED_TTL = 15 * 60
@@ -181,7 +189,11 @@ class Store:
             with self.lock:
                 if not self._dirty:
                     return
-                blob = json.dumps(self.data, indent=2, ensure_ascii=False)
+                # Compact separators, not indent=2: for a large library this cuts serialize time to about
+                # a quarter and the file by a third (≈5.1 s/190 MB → 1.4 s/126 MB at 520k articles), which
+                # matters because this runs under store.lock and blocks readers for its duration. The file
+                # is machine-written and machine-read, so human-readable indentation buys nothing.
+                blob = json.dumps(self.data, ensure_ascii=False, separators=(",", ":"))
                 self._dirty = False
             tmp = f"{self.path}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -242,11 +254,11 @@ class Store:
             return True
 
 
-store = Store(DB_PATH)
+store = remote_store_type(Store, REMOTE)(DB_PATH) if REMOTE else Store(DB_PATH)
 
 
-class CVEStore:
-    """Separate durable store for vulnerability records; article schema remains unchanged."""
+class PaperStore:
+    """Separate durable store for research-paper records; article schema remains unchanged."""
     def __init__(self, path):
         self.path, self.lock = path, threading.RLock()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -254,7 +266,7 @@ class CVEStore:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, list):
-                raise ValueError("CVE store is not a list")
+                raise ValueError("Paper store is not a list")
             self.records = {x["id"]: x for x in data if isinstance(x, dict) and x.get("id")}
         except FileNotFoundError:
             self.records = {}
@@ -262,30 +274,39 @@ class CVEStore:
             backup = f"{path}.broken-{int(time.time())}"
             try:
                 shutil.copy2(path, backup)
-                print(f"  CVE store could not be read ({type(exc).__name__}: {exc}); kept a copy at {backup}")
+                print(f"  Paper store could not be read ({type(exc).__name__}: {exc}); kept a copy at {backup}")
             except OSError:
-                print(f"  CVE store could not be read ({type(exc).__name__}: {exc})")
+                print(f"  Paper store could not be read ({type(exc).__name__}: {exc})")
             self.records = {}
 
     def all(self):
         with self.lock:
             return sorted((json.loads(json.dumps(x)) for x in self.records.values()),
-                          key=lambda x: x.get("updated") or x.get("published") or "", reverse=True)
+                          key=lambda x: x.get("saved_at") or x.get("published") or "", reverse=True)
+
+    def _write(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(self.records.values()), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
 
     def upsert(self, record):
         with self.lock:
             self.records[record["id"]] = record
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(list(self.records.values()), f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
+            self._write()
             return json.loads(json.dumps(record))
 
+    def upsert_many(self, records):
+        with self.lock:
+            for record in records:
+                self.records[record["id"]] = record
+            self._write()
+            return len(records)
 
-cve_store = CVEStore(CVE_DB_PATH)
-cve_catalog = CVECatalog(CVE_CATALOG_PATH)
-briefing_service = BriefingService()
-pipeline = PdfPipeline(STATIC_DIR)
+
+paper_store = RemotePapers(REMOTE) if REMOTE else PaperStore(PAPER_DB_PATH)
+briefing_service = BriefingService(resolver=resolve_article_url)
+pipeline = None if REMOTE else PdfPipeline(STATIC_DIR)
 jobs: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()  # the event loop only keeps weak references to running tasks
 JOB_TTL = 3600                     # finished jobs the UI may still poll for
@@ -357,19 +378,61 @@ EXISTS_TTL = 30  # seconds; /api/library would otherwise stat two files per arti
 
 
 def downloaded(rel):
-    """os.path.exists(abs_path(rel)), cached briefly. Only downloads change these, and a download
-    rewrites the article's row anyway, so a stale 'yes' can't outlive the file by more than EXISTS_TTL."""
+    """Does this article's file exist, cached briefly. Only downloads change these, and a download
+    rewrites the article's row (with a fresh path) anyway, so a stale 'yes' can't outlive the file by
+    more than EXISTS_TTL. The cache matters most in Telegram mode: there each check is a synchronous
+    round-trip over the TGFS pipe, serialized through one lock, and a library page runs one per row —
+    so an uncached /api/library poll would fire dozens of pipe calls every time (see EXISTS_TTL)."""
     if not rel:
         return False
     hit = _exists_cache.get(rel)
     now = time.time()
     if hit and now - hit[0] < EXISTS_TTL:
         return hit[1]
-    ok = os.path.exists(abs_path(rel))
+    if REMOTE:
+        try:
+            ok = REMOTE.exists("Medium-Library/" + safe_relative(rel))
+        except ValueError:
+            return False
+    else:
+        ok = os.path.exists(abs_path(rel))
     if len(_exists_cache) > 100_000:  # a whole library's worth of stale paths, after moves and removals
         _exists_cache.clear()
     _exists_cache[rel] = (now, ok)
     return ok
+
+
+def warm_downloaded_cache(articles):
+    """Prime _exists_cache for a whole page in one TGFS round-trip, so public() over the rows does not
+    fire one serialized pipe call per downloaded row. Telegram mode only; degrades silently to the
+    per-row checks in downloaded() on any error or count mismatch."""
+    if not REMOTE:
+        return
+    now = time.time()
+    want = []
+    for a in articles:
+        for rel in (a.get("doc"), a.get("pdf")):
+            if rel and not ((hit := _exists_cache.get(rel)) and now - hit[0] < EXISTS_TTL):
+                want.append(rel)
+    want = list(dict.fromkeys(want))  # dedupe, keep order
+    pairs = []
+    for rel in want:
+        try:
+            pairs.append((rel, "Medium-Library/" + safe_relative(rel)))
+        except ValueError:
+            pass  # leave invalid paths to downloaded(), which returns False for them
+    if not pairs:
+        return
+    try:
+        results = REMOTE.exists_many([key for _, key in pairs])
+    except Exception:
+        return
+    if len(results) != len(pairs):
+        return
+    if len(_exists_cache) > 100_000:
+        _exists_cache.clear()
+    for (rel, _), ok in zip(pairs, results):
+        _exists_cache[rel] = (now, bool(ok))
 
 
 def public(a):
@@ -425,7 +488,7 @@ def fetch_tag_feed(tag):
 
 PAGE_SIZE = 20
 STOPWORDS = {"a", "an", "and", "the", "of", "for", "to", "in", "on", "with", "how", "what", "why", "is", "are", "vs", "or", "by"}
-medium_index = MediumIndex(os.path.join(DATA_DIR, "search-index", "medium.db"), default_days=90)  # ~4 MB per day
+medium_index = RemoteIndex() if REMOTE else MediumIndex(os.path.join(DATA_DIR, "search-index", "medium.db"), default_days=90)
 
 
 def search_feeds(q, max_tags=6):
@@ -488,7 +551,9 @@ def web_search(q, offset=0):
         if extra and not found:
             provider = "feeds"
     notice = None
-    if young:
+    if REMOTE:
+        notice = "Telegram storage mode: live feed search only; the full search index stays in Telegram."
+    elif young:
         notice = (f"Your Medium search index is still being built: {st['posts']:,} articles from "
                   f"{st['days_indexed']} days so far. Results improve as it keeps crawling in the background.")
     elif res["mode"] != "all" and found:
@@ -510,11 +575,16 @@ async def lifespan(_app):
     medium_index.start()
     curator.start()
     yield
+    if REMOTE and _tasks:
+        await asyncio.gather(*list(_tasks), return_exceptions=True)
     curator.stop()
     medium_index.stop()
     briefing_service.stop()
-    pipeline.close()
-    store.stop()
+    if pipeline:
+        pipeline.close()
+    await asyncio.to_thread(store.stop)
+    if REMOTE:
+        await asyncio.to_thread(REMOTE.close)
 
 
 app = FastAPI(title="Library of Babel", lifespan=lifespan)
@@ -522,6 +592,19 @@ app = FastAPI(title="Library of Babel", lifespan=lifespan)
 
 class BriefingIn(BaseModel):
     days: int = 3
+    force: bool = False  # the explicit Generate button regenerates instead of reusing a fresh edition
+
+
+class BriefingSaveIn(BaseModel):
+    url: str
+    title: str | None = None
+    source: str | None = None
+    published: str | None = None
+    snippet: str | None = None
+
+
+BRIEFING_TOPIC, BRIEFING_SUBTOPIC = "custom", "morning-briefing"
+_briefing_saving: set[str] = set()  # article ids whose readable copy is being written right now
 
 
 @app.get("/api/briefing")
@@ -531,12 +614,132 @@ def briefing_status():
 
 @app.post("/api/briefing", status_code=202)
 def create_briefing(body: BriefingIn):
+    with store.lock:
+        interests = interest_tokens(store.data["topics"])
     try:
-        return briefing_service.start(body.days)
+        return briefing_service.start(body.days, interests=interests, force=body.force)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
+
+
+async def _write_readable_copy(a):
+    """Fetch the publisher page, extract a readable copy, and swap it into the article's folder.
+    Mirrors run_job's safe write: build in an .incoming- folder, then replace atomically."""
+    if REMOTE:
+        meta = await asyncio.to_thread(fetch_news_article, a["url"])
+        content = news_document(a, meta)
+        await asyncio.to_thread(save_remote_document, a, meta, content)
+        return
+    incoming = abs_path(f"{a['topic']}/{a['subtopic']}/.incoming-{a['id'][:8]}")
+
+    def build():
+        shutil.rmtree(incoming, ignore_errors=True)
+        os.makedirs(incoming, exist_ok=True)
+        meta = fetch_news_article(a["url"])
+        content = localize_images(news_document(a, meta), incoming)
+        with open(os.path.join(incoming, "content.html"), "w", encoding="utf-8") as f:
+            f.write(content)
+        return meta
+
+    meta = await asyncio.to_thread(build)
+    with store.lock:
+        if store.article(a["id"]) is not a:
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise PipelineError("This story was removed from the library while it was being saved.")
+        if meta.get("title"):
+            a["title"] = meta["title"]
+        a["image"] = a.get("image") or meta.get("image")
+        rel = folder_rel(a)
+        if a.get("doc"):
+            shutil.rmtree(abs_path(posixpath.dirname(a["doc"])), ignore_errors=True)
+        shutil.rmtree(abs_path(rel), ignore_errors=True)
+        os.makedirs(os.path.dirname(abs_path(rel)), exist_ok=True)
+        os.replace(incoming, abs_path(rel))
+        a["doc"], a["fetched"] = f"{rel}/content.html", now_iso()
+        _exists_cache.pop(a["doc"], None)
+        store.save()
+
+
+def remote_article_content(a):
+    """Render sanitized HTML in memory; do not launch a disk-backed Chromium profile."""
+    import medium_render
+    from pipeline import FREEDIUM_MIRRORS
+    route = medium_render.prepare(a['url'])
+    if route['route'] == 'medium':
+        meta, body = route['meta'], route['body']
+    else:
+        meta = None
+        problems = []
+        for base in FREEDIUM_MIRRORS:
+            try:
+                meta = fetch_news_article(base.rstrip('/') + '/' + a['url'])
+                break
+            except Exception as exc:
+                problems.append(f"{urlsplit(base).hostname}: {polite.describe_error(exc)}")
+                continue
+        if meta is None:
+            raise PipelineError((route.get('reason') or 'Direct article download failed') + '. '
+                                + 'Fallbacks failed: ' + '; '.join(problems)
+                                + '. No article was uploaded. Open the original article to check access.')
+        body = meta['body']
+    meta = dict(meta, route=route['route'], reason=route.get('reason', 'free story'))
+    return meta, medium_render.render_header(meta, a['url'], body, route['route']) + '\n' + body
+
+
+def save_remote_document(a, meta, content):
+    from pipeline import IMG_SRC, MAGIC
+    # Versioned keys avoid exposing half-replaced content if the final metadata save fails.
+    rel = 'remote-articles/' + a['id'] + '/' + uuid.uuid4().hex
+    images = {}
+    for i, url in enumerate(dict.fromkeys(html.unescape(u) for u in IMG_SRC.findall(content))):
+        try:
+            # max_bytes caps the read itself; an oversized body raises instead of being read into RAM.
+            data = polite.get(url, timeout=30, priority=True, max_bytes=20 * 1024 * 1024)
+            ext = next((ext for magic, ext in MAGIC if data.startswith(magic)), None)
+            if ext not in ('.png', '.jpg', '.gif', '.webp'):
+                continue
+            image_path = f'images/{i:03d}{ext}'
+            REMOTE.write('Medium-Library/' + rel + '/' + image_path, data)
+            images[url] = image_path
+        except Exception:
+            continue
+    # An unavailable image is omitted, so source servers cannot create a browser disk cache.
+    content = IMG_SRC.sub(lambda m: '<img src="' + images.get(html.unescape(m.group(1)), '') + '"', content)
+    REMOTE.write('Medium-Library/' + rel + '/content.html', content.encode())
+    with store.lock:
+        if store.article(a['id']) is not a:
+            raise PipelineError('This article was removed while it was being saved.')
+        a.update(title=meta.get('title') or a['title'], author=meta.get('author') or a.get('author', ''),
+                 doc=rel + '/content.html', fetched=now_iso(), via=meta.get('route'))
+        store.save()
+    store.flush()
+
+
+@app.post("/api/briefing/save")
+async def save_briefing(body: BriefingSaveIn):
+    # resolve_article_url may fetch to unwrap a Google News redirect; keep that off the event loop.
+    # normalize_url stays inline (pure, fast) so its 400 for a bad URL propagates as usual.
+    real = await asyncio.to_thread(resolve_article_url, normalize_url(body.url))
+    a = create_article({"url": real, "title": body.title, "source": "briefing",
+                        "snippet": body.snippet or "", "published": body.published,
+                        "topic": BRIEFING_TOPIC, "subtopic": BRIEFING_SUBTOPIC, "locked": False})
+    if downloaded(a.get("doc")):
+        return {"article": public(a), "fetched": True}
+    with store.lock:
+        if a["id"] in _briefing_saving:
+            return {"article": public(a), "fetched": False, "error": "This story is already being saved."}
+        _briefing_saving.add(a["id"])
+    try:
+        await _write_readable_copy(a)
+        return {"article": public(a), "fetched": True}
+    except Exception as exc:
+        # The article stays in the library as a link to the original even when extraction fails.
+        return {"article": public(a), "fetched": False, "error": str(exc)[:200]}
+    finally:
+        with store.lock:
+            _briefing_saving.discard(a["id"])
 
 
 class TopicIn(BaseModel):
@@ -573,6 +776,7 @@ def get_library():
     # FastAPI's generic encoder recursively walks every field of every article. A large
     # link-only library can contain tens of thousands of rows, making that walk dominate
     # the request. These values are already JSON-compatible, so serialize them once.
+    warm_downloaded_cache(articles)  # one TGFS round-trip instead of one per downloaded row
     rows = []
     for article in articles:
         row = public(article)
@@ -669,6 +873,7 @@ def get_library_first_page(limit: int = 60, topic_id: str = "", subtopic_id: str
             selected.append(dict(article))
             if len(selected) >= limit:
                 break
+    warm_downloaded_cache(selected)  # one TGFS round-trip instead of one per downloaded row
     rows = []
     for article in selected:
         row = public(article)
@@ -693,6 +898,7 @@ def get_library_page(offset: int = 0, limit: int = 60, topic_id: str = "", subto
     total = len(selected_scope)
     selected = [dict(article) for article in selected_scope[offset:offset + limit]]
 
+    warm_downloaded_cache(selected)  # one TGFS round-trip instead of one per downloaded row
     rows = []
     for article in selected:
         row = public(article)
@@ -747,7 +953,9 @@ def search_saved_library(q: str = "", limit: int = 20):
                  + 0.3 * bool(article.get("fetched")))
         scored.append((score, article.get("added") or "", article))
     scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
-    return {"items": [public(article) for _, _, article in scored[:limit]], "total": len(scored)}
+    top = [article for _, _, article in scored[:limit]]
+    warm_downloaded_cache(top)  # one TGFS round-trip instead of one per downloaded row
+    return {"items": [public(article) for article in top], "total": len(scored)}
 
 
 @app.post("/api/topics")
@@ -766,7 +974,8 @@ def create_topic(body: TopicIn):
     with store.lock:
         parent["subtopics"].append(sub)
         store.save()
-    os.makedirs(os.path.join(LIBRARY_DIR, parent["id"], sid), exist_ok=True)
+    if not REMOTE:
+        os.makedirs(os.path.join(LIBRARY_DIR, parent["id"], sid), exist_ok=True)
     return {"topic": parent["id"], "subtopic": sub}
 
 
@@ -797,7 +1006,7 @@ def delete_subtopic(tid: str, sid: str):
             remove_article(a)
         store.save()
     folder = os.path.join(LIBRARY_DIR, tid, sid)
-    if os.path.isdir(folder) and not os.listdir(folder):
+    if not REMOTE and os.path.isdir(folder) and not os.listdir(folder):
         os.rmdir(folder)
     return {"ok": True}
 
@@ -897,70 +1106,80 @@ async def search_medium(q: str = "", next: str | None = None):
             "parsed": res["parsed"]}
 
 
-class CVEImportIn(BaseModel):
-    cve_id: str
+class PaperImportIn(BaseModel):
+    doi: str
 
 
-@app.get("/api/cves")
-def list_cves():
-    return {"items": cve_store.all(), "sources": list(cve_sources.SOURCES)}
+@app.get("/api/papers")
+def list_papers():
+    # The UI never uses the full Crossref record; drop any legacy `raw` blob so the shelf payload
+    # stays small (it was over half the bytes) and the view renders quickly even with many papers.
+    items = paper_store.all()
+    for item in items:
+        item.pop("raw", None)
+    return {"items": items}
 
 
-@app.get("/api/cves/catalog/status")
-def cve_catalog_status():
-    return cve_catalog.status()
-
-
-@app.get("/api/cves/catalog/search")
-def search_cve_catalog(q: str = "", year: int | None = None, limit: int = 40, offset: int = 0):
-    if year is not None and (year < 1999 or year > datetime.now(timezone.utc).year + 2):
-        raise HTTPException(400, "Choose a valid CVE year.")
+@app.post("/api/papers/import")
+async def import_paper(body: PaperImportIn):
+    """Resolve a DOI through Crossref and upsert it into the research-paper shelf."""
     try:
-        return cve_catalog.search(q, year, limit, offset)
-    except (ValueError, OverflowError):
-        raise HTTPException(400, "Invalid catalog search options.")
-
-
-@app.get("/api/cves/catalog/{cve_id}")
-def get_cve_catalog_record(cve_id: str):
-    if not cve_sources.CVE_RE.fullmatch(cve_id):
-        raise HTTPException(400, "Enter a valid CVE identifier.")
-    record = cve_catalog.get(cve_id)
-    if not record:
-        raise HTTPException(404, "This CVE is not in the local CVE List V5 catalog yet.")
-    return record
-
-
-@app.post("/api/cves/catalog/sync")
-def sync_cve_catalog():
-    if not cve_catalog.start_sync():
-        return {"started": False, "status": cve_catalog.status()}
-    return {"started": True, "status": cve_catalog.status()}
-
-
-@app.post("/api/cves/import")
-async def import_cve(body: CVEImportIn):
-    """Enrich a CVE from public catalogs and upsert it into the local CVE library."""
-    try:
-        record = await asyncio.to_thread(cve_sources.enrich, body.cve_id)
+        record = await asyncio.to_thread(paper_sources.enrich, body.doi)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     except LookupError as exc:
         raise HTTPException(404, str(exc))
+    except (RuntimeError, OSError):  # Crossref 5xx/429 (RuntimeError) or a network failure (URLError/timeout)
+        raise HTTPException(502, "Crossref is unavailable right now. Try again in a moment.")
     record["saved_at"] = now_iso()
-    return cve_store.upsert(record)
+    # Offload the Telegram write like search_import does; upsert() blocks on a pipe round-trip and
+    # must not run on the event loop, or one DOI import freezes every other request during the upload.
+    return await asyncio.to_thread(paper_store.upsert, record)
 
 
-@app.delete("/api/cves/{cve_id}")
-def remove_cve(cve_id: str):
-    cve_id = cve_id.upper()
-    with cve_store.lock:
-        if not cve_store.records.pop(cve_id, None):
-            raise HTTPException(404, "CVE not found in your library.")
-        tmp = cve_store.path + ".tmp"
+class PaperSearchIn(BaseModel):
+    query: str
+    rows: int = 50
+
+
+@app.post("/api/papers/search_import")
+async def search_import_papers(body: PaperSearchIn):
+    """Add every Crossref match for a topic query to the shelf in one durable write."""
+    try:
+        records = await asyncio.to_thread(paper_sources.search, body.query, body.rows)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except (RuntimeError, OSError):  # Crossref 5xx/429 or a network failure
+        raise HTTPException(502, "Crossref is unavailable right now. Try again in a moment.")
+    if not records:
+        raise HTTPException(404, "Crossref returned no papers for that topic. Try different words.")
+    now = now_iso()
+    for record in records:
+        record["saved_at"] = now
+    added = await asyncio.to_thread(paper_store.upsert_many, records)
+    items = paper_store.all()
+    for item in items:
+        item.pop("raw", None)
+    return {"added": added, "items": items}
+
+
+@app.delete("/api/papers/{paper_id}")
+def remove_paper(paper_id: str):
+    with paper_store.lock:
+        removed = paper_store.records.pop(paper_id, None)
+        if not removed:
+            raise HTTPException(404, "Paper not found in your library.")
+        if REMOTE:
+            try:
+                paper_store.persist()
+            except Exception:
+                paper_store.records[paper_id] = removed
+                raise
+            return {"ok": True}
+        tmp = paper_store.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(list(cve_store.records.values()), f, ensure_ascii=False, indent=2)
-        os.replace(tmp, cve_store.path)
+            json.dump(list(paper_store.records.values()), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, paper_store.path)
     return {"ok": True}
 
 
@@ -984,6 +1203,8 @@ def index_status():
 
 @app.post("/api/index")
 def index_settings(body: IndexSettings):
+    if REMOTE:
+        raise HTTPException(409, "Local indexing and automatic curation are disabled in Telegram storage mode.")
     if body.days is not None:
         medium_index.set_days(body.days)
     if body.paused is not None:
@@ -1028,6 +1249,9 @@ def remove_article(a):
         return False
     if not store.discard(a):
         return False
+    if REMOTE:
+        # Keep archived content recoverable; the persisted tombstone removes it from the library.
+        return True
     if a.get("doc"):
         shutil.rmtree(abs_path(posixpath.dirname(a["doc"])), ignore_errors=True)
     elif a.get("pdf") and os.path.exists(abs_path(a["pdf"])):
@@ -1056,7 +1280,9 @@ def move_article(aid: str, body: MoveIn):
     with store.lock:
         old_pdf, old_doc = a.get("pdf"), a.get("doc")
         a["topic"], a["subtopic"] = body.topic, body.subtopic
-        if old_doc:
+        if REMOTE:
+            pass  # Physical remote keys stay stable when a story changes topic.
+        elif old_doc:
             old_dir, new_rel = abs_path(posixpath.dirname(old_doc)), folder_rel(a)
             if os.path.isdir(old_dir) and old_dir != abs_path(new_rel):
                 os.makedirs(os.path.dirname(abs_path(new_rel)), exist_ok=True)
@@ -1093,6 +1319,20 @@ async def run_job(job, a):
         job["stage"] = s
         job.update(info)  # route ("medium" | "freedium"), reason, freedium_url
         job.setdefault("timings", {})[s] = round(time.time() - job["started"], 1)  # seconds since start
+
+    if REMOTE:
+        try:
+            stage("fetching")
+            meta, content = await asyncio.to_thread(remote_article_content, a)
+            stage("uploading")
+            await asyncio.to_thread(save_remote_document, a, meta, content)
+            job.update(status="done", stage="done", article=public(a))
+        except Exception as exc:
+            job.update(status="error", error=str(exc))
+        finally:
+            with store.lock:
+                a.pop("fetching", None)
+        return
 
     # render into a scratch folder, then swap it in under the article's real title
     incoming = abs_path(f"{a['topic']}/{a['subtopic']}/.incoming-{a['id'][:8]}")
@@ -1143,13 +1383,18 @@ async def fetch_article(aid: str, force: bool = False):
     a = store.article(aid)
     if not a:
         raise HTTPException(404, "Article not found.")
-    if not force and a.get("pdf") and os.path.exists(abs_path(a["pdf"])):
+    if not force and (downloaded(a.get("doc")) or downloaded(a.get("pdf"))):
         return {"id": None, "status": "done", "stage": "done", "article": public(a)}
     running = next((j for j in jobs.values() if j["article_id"] == aid and j["status"] == "running"), None)
     if running:
         return running
-    job = {"id": uuid.uuid4().hex[:10], "article_id": aid, "status": "running", "stage": "queued", "started": time.time()}
     prune_jobs()
+    # Admission control: only MAX_PARALLEL render at once and the rest wait, so without a cap a burst of
+    # distinct requests would pile up unbounded tasks, job records and article references. Deduplicated
+    # re-requests above never reach here, so retrying a download already in flight is unaffected.
+    if sum(1 for j in jobs.values() if j["status"] == "running") >= MAX_ACTIVE_FETCHES:
+        raise HTTPException(503, "Too many downloads are in progress. Let some finish, then try again.")
+    job = {"id": uuid.uuid4().hex[:10], "article_id": aid, "status": "running", "stage": "queued", "started": time.time()}
     jobs[job["id"]] = job
     with store.lock:
         a["fetching"] = True
@@ -1170,6 +1415,11 @@ def notes_count(data):
 
 
 def read_notes(aid):
+    if REMOTE:
+        try:
+            return json.loads(REMOTE.read("notes/" + re.sub(r"[^0-9a-f]", "", aid) + ".json"))
+        except FileNotFoundError:
+            return {"notes": "", "summary": "", "highlights": []}
     path = notes_path(aid)
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -1192,6 +1442,17 @@ def notebook():
     with store.lock:
         articles = {a["id"]: a for a in store.data["articles"]}
     entries = []
+    if REMOTE:
+        for item in REMOTE.list("notes"):
+            aid = item['name'][:-5]
+            if item['directory'] or not item['name'].endswith('.json') or aid not in articles:
+                continue
+            data = read_notes(aid)
+            if notes_count(data):
+                edited = datetime.fromtimestamp(item['mtime'], timezone.utc).isoformat(timespec='seconds')
+                entries.append({"article": public(articles[aid]), "edited": edited, **data})
+        entries.sort(key=lambda e: e['edited'], reverse=True)
+        return {"entries": entries}
     if os.path.isdir(NOTES_DIR):
         for name in os.listdir(NOTES_DIR):
             aid = name[:-5]
@@ -1215,11 +1476,14 @@ def put_notes(aid: str, body: NotesIn):
     raw = json.dumps(data, ensure_ascii=False, indent=1)
     if len(raw) > 2_000_000:
         raise HTTPException(413, "Notes are too large to save.")
-    os.makedirs(NOTES_DIR, exist_ok=True)
-    tmp = notes_path(aid) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(raw)
-    os.replace(tmp, notes_path(aid))
+    if REMOTE:
+        REMOTE.write("notes/" + re.sub(r"[^0-9a-f]", "", aid) + ".json", raw.encode())
+    else:
+        os.makedirs(NOTES_DIR, exist_ok=True)
+        tmp = notes_path(aid) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(raw)
+        os.replace(tmp, notes_path(aid))
     count = notes_count(data)
     with store.lock:
         if a.get("notes_count", 0) != count:
@@ -1236,15 +1500,49 @@ def get_job(jid: str):
     return job
 
 
-curator = Curator(medium_index, store, create_article, remove_article)
-recommender = Recommender(store, curator.cache, notes_path, medium_index)
+curator = (remote_curator_type(Curator) if REMOTE else Curator)(medium_index, store, create_article, remove_article)
+recommender = Recommender(store, curator.cache, notes_path, None if REMOTE else medium_index)
+
+# Defense in depth. Article content is already sanitized (text escaped, tags allowlisted, links forced
+# to http(s)), so this is a backstop: inline scripts/styles stay allowed because the app's own theme
+# guard and lazy-CSS onload handlers need them, but connect-src/script-src('self')/object-src/base-uri/
+# frame-ancestors keep any injected content from loading external code, exfiltrating the library, or
+# being framed. img-src allows https so Medium's CDN thumbnails still load.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' https: data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+        "base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+}
+
+
+def _secure(response):
+    for key, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(key, value)
+    return response
+
 
 @app.middleware("http")
 async def cache_headers(request, call_next):
     """Let the browser keep what rarely changes. Stamped /static URLs (?v=mtime) and vendor libraries are
     cached for a year; article images for a day. Everything else under /files and /static revalidates
     (cheap 304s via ETag/Last-Modified), so re-downloaded articles show up immediately."""
-    response = await call_next(request)
+    response = _secure(await call_next(request))
+    if REMOTE:
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            try:
+                await asyncio.to_thread(store.flush)
+            except Exception:
+                from fastapi.responses import JSONResponse
+                response = _secure(JSONResponse({"detail": "Telegram save failed. Keep the app open and retry; changes remain in memory."}, status_code=503))
+        response.headers['Cache-Control'] = 'no-store'
+        if request.url.path == '/':
+            response.headers['Clear-Site-Data'] = '"cache"'
+        return response
     path = request.url.path
     if response.status_code != 200 or "cache-control" in response.headers:
         return response
@@ -1260,10 +1558,15 @@ async def cache_headers(request, call_next):
 class Compress:
     """gzip text responses (JS, CSS, JSON, article HTML) — the vendor libraries alone are ~1 MB raw
     over Wi-Fi to a phone. PDFs are already compressed, and a byte-range reply must not be re-encoded,
-    so those pass straight through."""
+    so those pass straight through.
+
+    Level 6 is the ratio/CPU sweet spot: over level 1 it drops KaTeX from 91 KB to 76 KB on the wire
+    and app.js from 38 KB to 31 KB, while level 9 saves barely another 1%. This is a single-user app
+    whose bottleneck is the phone's link, not the server CPU, and the big assets are immutable, so the
+    browser compresses each only once per cache lifetime."""
 
     def __init__(self, app):
-        self.app, self.gzip = app, GZipMiddleware(app, minimum_size=1024, compresslevel=1)
+        self.app, self.gzip = app, GZipMiddleware(app, minimum_size=1024, compresslevel=6)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
@@ -1275,13 +1578,33 @@ class Compress:
 
 app.add_middleware(Compress)
 
-app.mount("/files", StaticFiles(directory=LIBRARY_DIR), name="files")
+if REMOTE:
+    @app.get("/files/{path:path}")
+    def remote_file(path: str):
+        import mimetypes
+        try:
+            path = safe_relative(path)
+            # Only article media, never library records or recovery snapshots.
+            if path.rsplit('.', 1)[-1].lower() not in ('html', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif'):
+                raise HTTPException(404)
+            data = REMOTE.read('Medium-Library/' + path)
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(404)
+        return Response(data, media_type=mimetypes.guess_type(path)[0] or 'application/octet-stream',
+                        headers={'Cache-Control': 'no-store'})
+else:
+    app.mount("/files", StaticFiles(directory=LIBRARY_DIR), name="files")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/sw.js")
 def service_worker():
     """Served from the root so the worker's scope covers the whole app, not just /static/."""
+    if REMOTE:
+        return Response("self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));\n"
+                        "self.addEventListener('activate', e => e.waitUntil(caches.keys().then(ns => Promise.all(ns.filter(n => /^(shell|files|data)-v/.test(n)).map(n => caches.delete(n)))).then(() => self.clients.claim())));\n"
+                        "self.addEventListener('fetch', e => e.respondWith(fetch(e.request, {cache: 'no-store'})));",
+                        media_type='application/javascript', headers={'Cache-Control': 'no-store', 'Service-Worker-Allowed': '/'})
     with open(os.path.join(STATIC_DIR, "sw.js"), encoding="utf-8") as f:
         return Response(f.read(), media_type="application/javascript",
                         headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})

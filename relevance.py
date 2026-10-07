@@ -84,10 +84,6 @@ def stem(word):
     return word
 
 
-def stems(text):
-    return [stem(w) for w in words(text)]
-
-
 def match_level(term, token):
     """2 = the same word, 1 = the same word under stemming, 0 = unrelated."""
     if term == token:
@@ -118,10 +114,11 @@ def _as_day(value, today=None):
     value = value.strip().strip('"')
     rel = _REL_DATE.match(value)
     if rel:
-        n, unit = int(rel.group(1)), rel.group(2).lower()
+        unit = rel.group(2).lower()
         try:
+            n = int(rel.group(1))  # a very long digit run trips Python's int-string limit (ValueError)
             return (today - timedelta(days=n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit])).isoformat()
-        except OverflowError:  # "since:3000y" reaches before year 1
+        except (OverflowError, ValueError):  # unparseable count, or a date before year 1
             return None
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         return value

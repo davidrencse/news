@@ -7,6 +7,7 @@ story that is the complete text, so the app renders it into its own clean HTML. 
 routes those to Freedium.
 """
 import html
+import http.client
 import json
 import re
 import urllib.error
@@ -112,8 +113,11 @@ def prepare(url):
         if e.code in (404, 410):
             raise LookupError(f"Medium says this story doesn't exist (HTTP {e.code}).") from e
         return {"route": "freedium", "reason": f"Medium refused the direct download (HTTP {e.code})"}
-    except (urllib.error.URLError, TimeoutError) as e:
-        return {"route": "freedium", "reason": f"Medium was unreachable ({e})"}
+    except (OSError, http.client.HTTPException) as e:
+        # URLError and TimeoutError are OSErrors; also catch a dropped connection (ConnectionResetError)
+        # or truncated response (http.client.IncompleteRead), which otherwise escape and, in local mode,
+        # get misread as a Chromium crash — needlessly dropping the shared browser mid-render.
+        return {"route": "freedium", "reason": f"Medium was unreachable ({type(e).__name__})"}
 
     state, post = parse_post(page, url)
     if not post:
@@ -134,12 +138,17 @@ WRAP = {"STRONG": (1, "<strong>", "</strong>"), "EM": (2, "<em>", "</em>"), "COD
 
 def inline(state, text, markups):
     """Text with Medium's markups (offsets are UTF-16 code units, like JavaScript strings)."""
-    units = (text or "").encode("utf-16-le")
+    # surrogatepass: a Medium paragraph can carry a lone surrogate (e.g. a JSON "\ud83d" with no pair);
+    # plain utf-16-le encoding raises on it. The "replace" decode below then drops it to U+FFFD, so one
+    # malformed character can't abort the whole article render.
+    units = (text or "").encode("utf-16-le", "surrogatepass")
     n = len(units) // 2
     spans = []
     for m in markups or []:
         m = deref(state, m)
-        start, end = max(0, int(m.get("start") or 0)), min(n, int(m.get("end") or 0))
+        if not isinstance(m, dict):
+            continue
+        start, end = max(0, whole(m.get("start"))), min(n, whole(m.get("end")))  # whole(): no raise on junk offsets
         if end <= start:
             continue
         if m.get("type") == "A":
@@ -169,6 +178,8 @@ def _plain(fragment):
 def render_body(state, paragraphs, sections, meta):
     out, open_list = [], None
     for i, p in enumerate(paragraphs):
+        if not isinstance(p, dict):
+            continue  # a malformed post can carry a non-dict paragraph; skip rather than abort the render
         kind, text = p.get("type"), p.get("text") or ""
         # Medium repeats the title and subtitle as the first paragraphs; the header already shows them
         if i < 3 and kind in ("H2", "H3", "H4") and (_same(text, meta["title"]) or _same(text, meta["subtitle"])):

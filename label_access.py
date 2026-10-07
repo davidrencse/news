@@ -31,12 +31,13 @@ import socket
 import sys
 import time
 import urllib.error
-from datetime import date
+from datetime import date, timedelta
 
 import polite
 from curator import post_meta
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+RECHECK_DAYS = 7  # don't re-fetch a post whose access was checked within this many days
 
 
 def resolve_data_dir(explicit):
@@ -84,8 +85,13 @@ def main():
         data = json.load(f)
     arts = data["articles"]
 
-    # oldest first -- the stored list is newest-first, matching the curator's backfill order
-    todo = [a for a in reversed(arts) if "locked" not in a or a.get("locked") is None]
+    # oldest first -- the stored list is newest-first, matching the curator's backfill order.
+    # Skip anything checked within RECHECK_DAYS: a post Medium refuses comes back locked=None and would
+    # otherwise be re-fetched first on every run, so a --limit pass never advances past the oldest
+    # unresolvable posts. Never-checked rows (no locked_checked) and stale re-checks still qualify.
+    cutoff = (date.today() - timedelta(days=RECHECK_DAYS)).isoformat()
+    todo = [a for a in reversed(arts)
+            if a.get("locked") is None and a.get("locked_checked", "") < cutoff]
     total = len(todo)
     print(f"{len(arts):,} articles; {total:,} still unlabeled"
           + ("  [DRY RUN -- no writes]" if args.dry_run else ""))

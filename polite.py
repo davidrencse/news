@@ -9,9 +9,11 @@ Nothing here retries around a refusal: callers see the error and move on.
 """
 import threading
 import time
+import socket
+import ssl
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 USER_AGENT = "MediumLibrary/1.0 (personal offline reader)"
 BASE_GAP = {"medium.com": 1.0, "freedium-mirror.cfd": 3.0, "miro.medium.com": 0.1}  # seconds between requests
@@ -45,7 +47,7 @@ class HostLimiter:
             self.next_priority = min(self.next_priority, now + self.gap / 2)
 
     def wait(self, priority=False):
-        with self._lock:  # reserve a slot, then sleep outside the lock
+        with self._lock:  # reserve a slot once, then sleep outside the lock
             now = time.time()
             self._recover(now)
             if priority:
@@ -54,8 +56,15 @@ class HostLimiter:
             else:
                 at = max(now, self.pause_until, self.next_at)
                 self.next_at = at + self.gap
-        if at > now:
-            time.sleep(at - now)
+        # Sleep until the reserved slot, then recheck the shared cooldown: another request can be pushed
+        # back while we sleep, moving pause_until past our slot. Dispatching then would ignore a cooldown
+        # the site just asked for, so we wait again. The slot itself is booked only once, above.
+        while True:
+            now = time.time()
+            target = max(at, self.pause_until)  # float read is atomic under the GIL
+            if target <= now:
+                return
+            time.sleep(target - now)
 
     def succeeded(self):
         with self._lock:
@@ -67,10 +76,11 @@ class HostLimiter:
             self.pushbacks += 1
             self.codes[code] = self.codes.get(code, 0) + 1
             self.last_pushback = time.time()
-            # A site's own Retry-After is honoured exactly. Our fallback guess is capped: gap * 10 at
-            # the maximum gap would sit out an hour and forty minutes, and the gap alone (up to
-            # MAX_GAP between requests) is already most of the backoff.
-            pause = min(retry_after, MAX_GAP) if retry_after else (0 if code == 403 else min(MAX_GAP, self.gap * 10))
+            # A site's own Retry-After is honoured exactly, however long: it is an explicit instruction,
+            # and sitting out less than asked invites a longer ban. MAX_GAP caps only the per-request
+            # gap and our fallback guess (when no Retry-After is given); it must not truncate a cooldown
+            # the site itself requested.
+            pause = retry_after if retry_after else (0 if code == 403 else min(MAX_GAP, self.gap * 10))
             self.pause_until = max(self.pause_until, time.time() + pause)
 
 
@@ -93,22 +103,49 @@ def limiter(url_or_host):
         return _limiters[site]
 
 
-def get(url, timeout=40, headers=None, priority=False):
+def get(url, timeout=40, headers=None, priority=False, max_bytes=None):
     """GET a URL through its site's limiter. Returns bytes; raises urllib errors like urlopen.
-    priority=True for requests a person is waiting on."""
+    priority=True for requests a person is waiting on. max_bytes caps how much is read into memory
+    (a hostile or mislabelled image URL can otherwise stream gigabytes); an over-limit body raises
+    ValueError instead of being read in full."""
+    # HTTP request targets are ASCII. Keep existing escapes and URL delimiters intact.
+    parts = urlsplit(url)
+    safe = "/%:@!$&'()*+,;=-._~"
+    url = urlunsplit((parts.scheme, parts.netloc, quote(parts.path, safe=safe),
+                     quote(parts.query, safe=safe + '?'), parts.fragment))
     lim = limiter(url)
     lim.wait(priority)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read()
+            body = r.read() if max_bytes is None else r.read(max_bytes + 1)
     except urllib.error.HTTPError as e:
         if e.code in PUSHBACK:
             ra = e.headers.get("Retry-After", "") if e.headers else ""
             lim.pushed_back(e.code, int(ra) if ra.isdigit() else None)
         raise
     lim.succeeded()
+    if max_bytes is not None and len(body) > max_bytes:
+        raise ValueError(f"response larger than {max_bytes} bytes")
     return body
+
+
+def describe_error(exc):
+    """Concise source diagnostics without exposing a URL, credentials, or response body."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, socket.gaierror):
+        return "DNS lookup failed"
+    if isinstance(reason, ssl.SSLError):
+        return "TLS connection failed"
+    if isinstance(reason, TimeoutError):
+        return "request timed out"
+    if isinstance(reason, OSError):
+        return f"connection failed ({type(reason).__name__})"
+    if isinstance(reason, ValueError):
+        return "article extraction failed"
+    return type(reason).__name__
 
 
 def get_text(url, timeout=40, priority=False):

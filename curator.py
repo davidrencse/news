@@ -169,6 +169,7 @@ class MetaCache:
         self.path = path
         self._lock = threading.Lock()
         self._data = {}
+        self.rev = 0  # bumped on every set(); lets readers notice in-place meta updates len() can't
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 self._data = json.load(f)
@@ -186,6 +187,7 @@ class MetaCache:
     def set(self, url, meta):
         with self._lock:
             self._data[url] = meta
+            self.rev += 1
 
     def __len__(self):
         return len(self._data)
